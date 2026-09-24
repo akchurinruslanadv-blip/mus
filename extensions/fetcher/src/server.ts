@@ -18,7 +18,7 @@ import { fetchAudioStream, updateYtDlp } from "./fetcher.ts";
 import { getCacheStats, enforceLruCache, cleanCacheNow } from "./lru.ts";
 import { startQueueWatcher } from "./queue_watcher.ts";
 import { resolveTrackAudio, pinTrackForever, unpinTrackFromStorage } from "./stream_proxy.ts";
-import { find12DCandidates, getColdStartSeeds } from "./dataset_bridge.ts";
+import { find12DCandidates, getColdStartSeeds, findPredictiveCatalogTracks } from "./dataset_bridge.ts";
 import { ingestionWorker } from "./ingestion_worker.ts";
 import { radioPoolManager } from "./radio_pool.ts";
 
@@ -439,6 +439,60 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     } catch (e) {
       return new Response(JSON.stringify({ error: String(e) }), { status: 400, headers });
     }
+  }
+
+  // 7b. Predictive 512D Background Indexing of Catalog Tracks Matching User Taste
+  if (url.pathname === "/api/v1/catalog/preindex-512" && req.method === "POST") {
+    try {
+      let count = 15;
+      try {
+        const body = await req.json();
+        if (body.count) count = Math.min(50, Math.max(1, parseInt(body.count)));
+      } catch {}
+
+      const candidates = findPredictiveCatalogTracks(count);
+      if (candidates.length === 0) {
+        return new Response(JSON.stringify({ success: false, message: "Нет доступных новых треков для оцифровки" }), { headers });
+      }
+
+      const tasks = candidates.map(c => ({
+        artist: c.artist,
+        title: c.title,
+        addToFavorites: false, // Don't distort favorites
+        pinForever: false,     // Managed cleanly by 3GB LRU cache
+        autoEmbed512: true     // Digitized into 512D neural vector!
+      }));
+
+      const added = addIngestionTasks(tasks);
+      ingestionWorker.resume();
+
+      return new Response(JSON.stringify({ 
+        success: true, 
+        added, 
+        candidates: candidates.map(c => ({
+          track: `${c.artist} - ${c.title}`,
+          genre: c.genre,
+          affinity: Math.round(c.score * 100) + "%"
+        }))
+      }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers });
+    }
+  }
+
+  // 7c. Status of 512D Background Preindexing
+  if (url.pathname === "/api/v1/catalog/preindex-status" && req.method === "GET") {
+    const workerStatus = ingestionWorker.getStatus();
+    const db = getDb();
+    const total512 = (db.prepare(`SELECT count(*) as c FROM features`).get() as { c?: number })?.c || 0;
+    const totalCatalog = (db.prepare(`SELECT count(*) as c FROM external_catalog`).get() as { c?: number })?.c || 0;
+
+    return new Response(JSON.stringify({
+      active: workerStatus.pending > 0 || workerStatus.processing > 0,
+      workerStatus,
+      total512,
+      totalCatalog
+    }), { headers });
   }
 
   // 8. Ingestion Queue API (Import Playlist by titles)

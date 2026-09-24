@@ -258,7 +258,8 @@
         </div>
         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
           <span style="font-size:0.8rem; opacity:0.85;" id="addon-cache-details">Загрузка статистики 512D…</span>
-          <div style="display:flex; gap:8px;">
+          <div style="display:flex; gap:8px; flex-wrap:wrap;">
+            <button type="button" id="btn-addon-preindex-512" class="btn quiet" style="padding:4px 12px; font-size:0.85rem; border-color:#38bdf8; color:#38bdf8; font-weight:700;" title="Подобрать из каталога 250k+ треки под ваш вкус и оцифровать их нейросетью CLAP (512D) в фоне">🧠 Индексировать топ-рекомендации в 512D</button>
             <button type="button" id="btn-addon-clean-cache" class="btn quiet" style="padding:4px 12px; font-size:0.85rem;">Очистить временное аудио</button>
             <button type="button" id="btn-addon-update-ytdlp" class="btn quiet" style="padding:4px 12px; font-size:0.85rem;" title="Обновить инструмент загрузки аудио">⚡ Обновить yt-dlp</button>
           </div>
@@ -370,6 +371,67 @@
           toast("Сбой соединения: " + e.message);
         } finally {
           updateYtdlpBtn.disabled = false;
+        }
+      };
+    }
+
+    const preindexBtn = document.getElementById("btn-addon-preindex-512");
+    if (preindexBtn) {
+      preindexBtn.onclick = async () => {
+        if (preindexBtn.dataset.loading === "1") return;
+        preindexBtn.dataset.loading = "1";
+        const origText = preindexBtn.innerHTML;
+        preindexBtn.innerHTML = `⏳ Подбор лучших треков...`;
+        preindexBtn.style.opacity = "0.75";
+
+        try {
+          const res = await fetch(`${API_BASE}/api/v1/catalog/preindex-512`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ count: 15 })
+          });
+          const data = await res.json();
+          if (!data.success) {
+            toast(data.message || "Не удалось подобрать треки");
+            preindexBtn.innerHTML = origText;
+            preindexBtn.dataset.loading = "0";
+            preindexBtn.style.opacity = "1";
+            return;
+          }
+
+          toast(`🚀 Запущен фоновый 512D-майнинг ${data.added} треков под ваш вкус!`);
+
+          const pollTimer = setInterval(async () => {
+            try {
+              const sRes = await fetch(`${API_BASE}/api/v1/catalog/preindex-status`);
+              const sData = await sRes.json();
+              if (sData.active) {
+                const ws = sData.workerStatus;
+                const cur = ws.currentTrack ? `${ws.currentTrack.artist} - ${ws.currentTrack.title}` : "...";
+                preindexBtn.innerHTML = `⚡ 512D: ${ws.completed} готово, ${ws.pending} в очереди (${cur.slice(0, 30)}…)`;
+                updateCacheStats();
+              } else {
+                clearInterval(pollTimer);
+                preindexBtn.innerHTML = `✅ Оцифровано! (Всего ${sData.total512} векторов)`;
+                updateCacheStats();
+                setTimeout(() => {
+                  preindexBtn.innerHTML = origText;
+                  preindexBtn.dataset.loading = "0";
+                  preindexBtn.style.opacity = "1";
+                }, 4000);
+              }
+            } catch {
+              clearInterval(pollTimer);
+              preindexBtn.innerHTML = origText;
+              preindexBtn.dataset.loading = "0";
+              preindexBtn.style.opacity = "1";
+            }
+          }, 3000);
+        } catch (e) {
+          toast("Ошибка запуска 512D-майнинга: " + e.message);
+          preindexBtn.innerHTML = origText;
+          preindexBtn.dataset.loading = "0";
+          preindexBtn.style.opacity = "1";
         }
       };
     }
@@ -582,14 +644,30 @@
         <span style="opacity:0.4;">|</span>
         <span style="color:#38bdf8; font-weight:700;">🧠 512D Векторов:</span>
         <span id="addon-home-512" style="color:#38bdf8; font-weight:700; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.35); padding:2px 8px; border-radius:8px;">Загрузка…</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button type="button" class="btn quiet sm" id="btn-home-preindex-512" style="padding:4px 10px; font-size:0.82rem; border-color:#38bdf8; color:#38bdf8; font-weight:700; cursor:pointer;" title="Подобрать из каталога 250k+ треки под ваш вкус и оцифровать их нейросетью CLAP (512D) в фоне">
+          🧠 512D Майнинг
+        </button>
+        <button type="button" class="btn quiet sm" id="btn-home-goto-upload" style="padding:4px 12px; font-size:0.82rem; border-color:rgba(224,122,58,0.5); cursor:pointer;">
+          📥 Импорт плейлиста →
+        </button>
       </div>
-      <button type="button" class="btn quiet sm" id="btn-home-goto-upload" style="padding:4px 12px; font-size:0.82rem; border-color:rgba(224,122,58,0.5); cursor:pointer;">
-        📥 Импорт плейлиста (512D) →
-      </button>
     `;
 
 
     homeIntro.appendChild(banner);
+
+    const homePreindexBtn = document.getElementById("btn-home-preindex-512");
+    if (homePreindexBtn) {
+      homePreindexBtn.onclick = () => {
+        const uploadTab = document.querySelector('[data-view="upload"]');
+        if (uploadTab) uploadTab.click();
+        setTimeout(() => {
+          const mainPreindexBtn = document.getElementById("btn-addon-preindex-512");
+          if (mainPreindexBtn) mainPreindexBtn.click();
+        }, 150);
+      };
+    }
 
     const gotoBtn = document.getElementById("btn-home-goto-upload");
     if (gotoBtn) {
