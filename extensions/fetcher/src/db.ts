@@ -1,7 +1,7 @@
 // extensions/fetcher/src/db.ts: Database Access & Schema Migrations
 import { Database } from "@db/sqlite";
 import { config } from "./config.ts";
-import { ExternalCatalogTrack, AcousticFeatures12D } from "./types.ts";
+import { ExternalCatalogTrack, AcousticFeatures12D, AcousticBiases, RadioSettings } from "./types.ts";
 
 let _db: Database | null = null;
 
@@ -76,9 +76,14 @@ export function initSchema(db: Database): void {
     CREATE TABLE IF NOT EXISTS radio_settings (
       session_id TEXT PRIMARY KEY,
       discovery_ratio REAL NOT NULL DEFAULT 0.5,
+      biases_json TEXT DEFAULT '{}',
       updated_at TEXT NOT NULL
     )
   `).run();
+
+  try {
+    db.exec(`ALTER TABLE radio_settings ADD COLUMN biases_json TEXT DEFAULT '{}';`);
+  } catch {}
 
   // Indices for fast search
 
@@ -599,5 +604,55 @@ export function setDiscoveryRatio(sessionId = "default", ratio: number, db = get
     console.warn("[db] setDiscoveryRatio error:", e);
   }
   return clamped;
+}
+
+export function getRadioSettings(sessionId = "default", db = getDb()): RadioSettings {
+  try {
+    const row = db.prepare(`SELECT discovery_ratio, biases_json FROM radio_settings WHERE session_id = ?`).get(sessionId) as { discovery_ratio: number; biases_json?: string } | undefined;
+    if (row) {
+      let biases: AcousticBiases = {};
+      try {
+        if (row.biases_json) biases = JSON.parse(row.biases_json);
+      } catch {}
+      return {
+        discoveryRatio: typeof row.discovery_ratio === "number" ? row.discovery_ratio : 0.5,
+        biases
+      };
+    }
+    if (sessionId !== "default") {
+      const defRow = db.prepare(`SELECT discovery_ratio, biases_json FROM radio_settings WHERE session_id = 'default'`).get() as { discovery_ratio: number; biases_json?: string } | undefined;
+      if (defRow) {
+        let biases: AcousticBiases = {};
+        try {
+          if (defRow.biases_json) biases = JSON.parse(defRow.biases_json);
+        } catch {}
+        return {
+          discoveryRatio: typeof defRow.discovery_ratio === "number" ? defRow.discovery_ratio : 0.5,
+          biases
+        };
+      }
+    }
+  } catch {}
+  return { discoveryRatio: 0.5, biases: {} };
+}
+
+export function setRadioSettings(sessionId = "default", settings: { discoveryRatio?: number; biases?: AcousticBiases }, db = getDb()): RadioSettings {
+  const current = getRadioSettings(sessionId, db);
+  const ratio = settings.discoveryRatio !== undefined ? Math.max(0, Math.min(1, settings.discoveryRatio)) : current.discoveryRatio;
+  const biases = settings.biases !== undefined ? settings.biases : current.biases;
+  const now = new Date().toISOString();
+  try {
+    db.prepare(`
+      INSERT INTO radio_settings (session_id, discovery_ratio, biases_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        discovery_ratio = excluded.discovery_ratio,
+        biases_json = excluded.biases_json,
+        updated_at = excluded.updated_at
+    `).run(sessionId, ratio, JSON.stringify(biases), now);
+  } catch (e) {
+    console.warn("[db] setRadioSettings error:", e);
+  }
+  return { discoveryRatio: ratio, biases };
 }
 

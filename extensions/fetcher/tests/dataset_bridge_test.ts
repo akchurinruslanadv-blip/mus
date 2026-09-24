@@ -124,5 +124,25 @@ Deno.test("DatasetBridge: Cold-start seeds and candidate search", () => {
   assertEquals(candidates.length, 1);
   assertEquals(candidates[0].artist, "Nirvana", "Candidate search should prioritize closest acoustic match");
 
+  // Bias shift test: Steering towards acousticness should flip candidate to The Beatles
+  const biasedCandidates = find12DCandidates({
+    danceability: 0.45,
+    energy: 0.60,
+    key: 3,
+    loudness: -8,
+    mode: 1,
+    speechiness: 0.04,
+    acousticness: 0.20,
+    instrumentalness: 0.0,
+    liveness: 0.1,
+    valence: 0.50,
+    tempo: 105
+  }, 1, new Set(), db, {
+    energy: -0.4,
+    acousticness: +0.6
+  });
+
+  assertEquals(biasedCandidates[0].artist, "The Beatles", "Acoustic bias should steer recommendation towards acoustic tracks");
+
   db.close();
 });

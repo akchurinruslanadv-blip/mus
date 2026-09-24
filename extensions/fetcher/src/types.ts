@@ -15,6 +15,18 @@ export interface AcousticFeatures12D {
   duration_sec?: number;    // seconds
 }
 
+export interface AcousticBiases {
+  energy?: number;       // -0.5 to +0.5
+  valence?: number;      // -0.5 to +0.5
+  acousticness?: number; // -0.5 to +0.5
+  tempo?: number;        // -0.5 to +0.5
+}
+
+export interface RadioSettings {
+  discoveryRatio: number;
+  biases: AcousticBiases;
+}
+
 export type StorageLocation = "catalog" | "cached" | "liked" | "pinned";
 
 export interface ExternalCatalogTrack {

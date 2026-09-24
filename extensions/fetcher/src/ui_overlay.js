@@ -148,13 +148,111 @@
     }
   });
 
-  // Load persisted setting from server on mount
+  // Acoustic Vector Biases Sliders (12D Vector Steering)
+  let biasesDebounceTimer = null;
+
+  function syncAcousticBiases() {
+    clearTimeout(biasesDebounceTimer);
+    biasesDebounceTimer = setTimeout(async () => {
+      try {
+        const biases = {
+          energy: energyBiasSlider.getValue() / 100,
+          valence: valenceBiasSlider.getValue() / 100,
+          acousticness: acousticBiasSlider.getValue() / 100,
+          tempo: tempoBiasSlider.getValue() / 100
+        };
+        const res = await fetch(`${API_BASE}/api/v1/radio/settings`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ 
+            biases, 
+            discoveryRatio: discoveryBalanceSlider.getValue() / 100,
+            sessionId: getDeviceId() 
+          })
+        });
+        const data = await res.json();
+        if (data && Array.isArray(data.queue) && data.queue.length > 0) {
+          if (typeof window.renderQueue === "function") {
+            window.renderQueue(data.queue);
+          }
+          setTimeout(updateQueueOrigins, 60);
+        }
+        
+        // Update summary badge
+        const badge = document.getElementById("eq-summary-badge");
+        if (badge) {
+          const nonZero = [];
+          if (biases.energy !== 0) nonZero.push(biases.energy > 0 ? "⚡ Драйв" : "🌙 Чилл");
+          if (biases.valence !== 0) nonZero.push(biases.valence > 0 ? "☀️ Позитив" : "🌧️ Грусть");
+          if (biases.acousticness !== 0) nonZero.push(biases.acousticness > 0 ? "🎸 Акустика" : "🎹 Синтетика");
+          if (biases.tempo !== 0) nonZero.push(biases.tempo > 0 ? "⏩ Быстрее" : "⏪ Медленнее");
+          badge.textContent = nonZero.length > 0 ? nonZero.join(" • ") : "Нейтрально";
+          badge.style.color = nonZero.length > 0 ? "#38bdf8" : "#94a3b8";
+        }
+      } catch {}
+    }, 150);
+  }
+
+  const energyBiasSlider = new CustomAudioSlider({
+    id: "slider-bias-energy",
+    label: "⚡ Драйв / Энергия",
+    min: -50,
+    max: 50,
+    step: 5,
+    defaultValue: 0,
+    formatFn: (v) => v === 0 ? "Нейтрально" : v > 0 ? `+${v}% Драйв` : `${v}% Чилл`,
+    onChange: () => syncAcousticBiases()
+  });
+
+  const valenceBiasSlider = new CustomAudioSlider({
+    id: "slider-bias-valence",
+    label: "🎭 Вайб / Настроение",
+    min: -50,
+    max: 50,
+    step: 5,
+    defaultValue: 0,
+    formatFn: (v) => v === 0 ? "Нейтрально" : v > 0 ? `+${v}% Позитив` : `${v}% Грусть`,
+    onChange: () => syncAcousticBiases()
+  });
+
+  const acousticBiasSlider = new CustomAudioSlider({
+    id: "slider-bias-acoustic",
+    label: "🎸 Звучание",
+    min: -50,
+    max: 50,
+    step: 5,
+    defaultValue: 0,
+    formatFn: (v) => v === 0 ? "Нейтрально" : v > 0 ? `+${v}% Акустика` : `${v}% Синтетика`,
+    onChange: () => syncAcousticBiases()
+  });
+
+  const tempoBiasSlider = new CustomAudioSlider({
+    id: "slider-bias-tempo",
+    label: "⏱️ Темп",
+    min: -30,
+    max: 30,
+    step: 5,
+    defaultValue: 0,
+    formatFn: (v) => v === 0 ? "Нейтрально" : v > 0 ? `+${v}% Быстрее` : `${v}% Медленнее`,
+    onChange: () => syncAcousticBiases()
+  });
+
+  // Load persisted settings from server on mount
   fetch(`${API_BASE}/api/v1/radio/settings?session_id=${getDeviceId()}`)
     .then(r => r.json())
     .then(data => {
-      if (data && data.settings && typeof data.settings.discoveryRatio === "number") {
-        const pct = Math.round(data.settings.discoveryRatio * 100);
-        discoveryBalanceSlider.setValue(pct);
+      if (data && data.settings) {
+        if (typeof data.settings.discoveryRatio === "number") {
+          const pct = Math.round(data.settings.discoveryRatio * 100);
+          discoveryBalanceSlider.setValue(pct);
+        }
+        if (data.settings.biases) {
+          const b = data.settings.biases;
+          if (typeof b.energy === "number") energyBiasSlider.setValue(Math.round(b.energy * 100));
+          if (typeof b.valence === "number") valenceBiasSlider.setValue(Math.round(b.valence * 100));
+          if (typeof b.acousticness === "number") acousticBiasSlider.setValue(Math.round(b.acousticness * 100));
+          if (typeof b.tempo === "number") tempoBiasSlider.setValue(Math.round(b.tempo * 100));
+        }
       }
     })
     .catch(() => {});
@@ -951,21 +1049,67 @@
     } catch {}
   }
 
-  // 3.6 Inject Custom Audio Sliders into Queue Panel
+  // 3.6 Inject Custom Audio Sliders & Acoustic Equalizer into Queue Panel
   function injectRadioSliders() {
     const queuePanel = document.querySelector(".queue-panel");
-    if (!queuePanel || document.getElementById(`wrap-${discoveryBalanceSlider.id}`)) return;
+    if (!queuePanel || document.getElementById("addon-sliders-block")) return;
 
     const sliderEl = discoveryBalanceSlider.render();
+
+    // Create collapsible 12D Acoustic Equalizer
+    let eqWrap = document.getElementById("wrap-acoustic-equalizer");
+    if (!eqWrap) {
+      eqWrap = document.createElement("details");
+      eqWrap.id = "wrap-acoustic-equalizer";
+      eqWrap.style.cssText = "background: rgba(0,0,0,0.32); border: 1px solid rgba(56,189,248,0.25); border-radius: 12px; padding: 6px 10px; margin: 6px 0;";
+      eqWrap.innerHTML = `
+        <summary style="cursor: pointer; font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; user-select: none;">
+          <span style="display: flex; align-items: center; gap: 6px;">🎛️ Эквалайзер настроения (12D)</span>
+          <span id="eq-summary-badge" style="font-size: 0.72rem; opacity: 0.85; background: rgba(56,189,248,0.15); border: 1px solid rgba(56,189,248,0.3); padding: 1px 6px; border-radius: 6px; color: #94a3b8;">Нейтрально</span>
+        </summary>
+        <div id="eq-sliders-container" style="margin-top: 6px; display: flex; flex-direction: column; gap: 4px;">
+          <!-- 4 Biases Sliders -->
+          <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
+            <button type="button" id="btn-reset-eq" class="btn quiet sm" style="font-size: 0.75rem; padding: 2px 8px; color: #94a3b8; border-color: rgba(255,255,255,0.2); cursor: pointer;">
+              ↺ Сбросить в 0 (Нейтраль)
+            </button>
+          </div>
+        </div>
+      `;
+
+      const eqContainer = eqWrap.querySelector("#eq-sliders-container");
+      eqContainer.insertBefore(energyBiasSlider.render(), eqContainer.firstChild);
+      eqContainer.insertBefore(valenceBiasSlider.render(), eqContainer.children[1]);
+      eqContainer.insertBefore(acousticBiasSlider.render(), eqContainer.children[2]);
+      eqContainer.insertBefore(tempoBiasSlider.render(), eqContainer.children[3]);
+
+      const resetBtn = eqWrap.querySelector("#btn-reset-eq");
+      if (resetBtn) {
+        resetBtn.onclick = () => {
+          energyBiasSlider.setValue(0);
+          valenceBiasSlider.setValue(0);
+          acousticBiasSlider.setValue(0);
+          tempoBiasSlider.setValue(0);
+          syncAcousticBiases();
+          toast("↺ Настройки настроения сброшены в нейтраль");
+        };
+      }
+    }
+
+    const container = document.createElement("div");
+    container.id = "addon-sliders-block";
+    container.appendChild(sliderEl);
+    container.appendChild(eqWrap);
+
     const tabBar = document.getElementById("addon-queue-tab-bar");
     if (tabBar) {
-      queuePanel.insertBefore(sliderEl, tabBar);
+      queuePanel.insertBefore(container, tabBar);
     } else {
       const queueHead = queuePanel.querySelector(".queue-head");
       if (queueHead && queueHead.nextSibling) {
-        queuePanel.insertBefore(sliderEl, queueHead.nextSibling);
+        queuePanel.insertBefore(container, queueHead.nextSibling);
       } else {
-        queuePanel.prepend(sliderEl);
+        queuePanel.prepend(container);
       }
     }
   }

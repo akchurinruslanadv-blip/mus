@@ -1,8 +1,19 @@
 // extensions/fetcher/src/dataset_bridge.ts: 12D Catalog Matching & Radio Blending
 import { config } from "./config.ts";
 import { getDb } from "./db.ts";
-import { AcousticFeatures12D, CandidateHit, ExternalCatalogTrack } from "./types.ts";
+import { AcousticFeatures12D, CandidateHit, ExternalCatalogTrack, AcousticBiases } from "./types.ts";
 
+// Apply user interactive slider biases to shift the recommendation vector
+export function applyAcousticBiases(seed: AcousticFeatures12D, biases?: AcousticBiases): AcousticFeatures12D {
+  if (!biases) return seed;
+  return {
+    ...seed,
+    energy: Math.max(0, Math.min(1, seed.energy + (biases.energy || 0))),
+    valence: Math.max(0, Math.min(1, seed.valence + (biases.valence || 0))),
+    acousticness: Math.max(0, Math.min(1, seed.acousticness + (biases.acousticness || 0))),
+    tempo: Math.max(40, Math.min(240, seed.tempo * (1 + (biases.tempo || 0))))
+  };
+}
 
 // Normalized distance in 12D acoustic space
 export function compute12DDistance(a: AcousticFeatures12D, b: AcousticFeatures12D): number {
@@ -24,8 +35,10 @@ export function find12DCandidates(
   seed: AcousticFeatures12D,
   limit = 5,
   excludeTitles: Set<string> = new Set(),
-  db = getDb()
+  db = getDb(),
+  biases?: AcousticBiases
 ): CandidateHit[] {
+  const effectiveSeed = applyAcousticBiases(seed, biases);
   type RowType = {
     id: number;
     artist: string;
@@ -77,7 +90,7 @@ export function find12DCandidates(
     if (!f) continue;
     if (f.speechiness && f.speechiness > config.maxSpeechiness) continue;
 
-    const dist = compute12DDistance(seed, f);
+    const dist = compute12DDistance(effectiveSeed, f);
     scored.push({ track: row, features: f, dist });
   }
 
@@ -183,7 +196,8 @@ export function insertExternal12DTracksBatch(
 // Predict top catalog tracks matching user taste that can be pre-indexed into 512D
 export function findPredictiveCatalogTracks(
   count = 15,
-  db = getDb()
+  db = getDb(),
+  biases?: AcousticBiases
 ): { artist: string; title: string; genre: string; score: number }[] {
   // 1. Compute user acoustic profile from favorites / played tracks
   type FeatRow = { features_json: string };
@@ -254,6 +268,9 @@ export function findPredictiveCatalogTracks(
       };
     }
   }
+
+  // Apply user-defined acoustic biases to shift seed vector
+  seed = applyAcousticBiases(seed, biases);
 
   // 2. Fetch candidates from external_catalog that are not yet in library or ingestion queue
   type CandidateRow = {

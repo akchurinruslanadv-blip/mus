@@ -12,7 +12,9 @@ import {
   updateSessionQueue, 
   resetSessionExcludeIfExhausted,
   getDiscoveryRatio,
-  setDiscoveryRatio
+  setDiscoveryRatio,
+  getRadioSettings,
+  setRadioSettings
 } from "./db.ts";
 import { fetchAudioStream, updateYtDlp } from "./fetcher.ts";
 import { getCacheStats, enforceLruCache, cleanCacheNow } from "./lru.ts";
@@ -369,7 +371,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     }
   }
 
-  // 5.7 Radio Settings (Discovery Balance) - P1: Persistent in SQLite per session/device
+  // 5.7 Radio Settings (Discovery Balance & Acoustic Vector Biases) - Persistent in SQLite per session/device
   if (url.pathname === "/api/v1/radio/settings" && req.method === "POST") {
     try {
       const body = await req.json();
@@ -377,14 +379,16 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       const activeSession = getActiveSession(db);
       const sessionId = body.sessionId || body.session_id || (activeSession ? activeSession.id : "default");
 
-      let ratio = 0.5;
-      if (typeof body.discoveryRatio === "number") {
-        ratio = setDiscoveryRatio(sessionId, body.discoveryRatio, db);
-        if (sessionId !== "default") {
-          setDiscoveryRatio("default", body.discoveryRatio, db);
-        }
-      } else {
-        ratio = getDiscoveryRatio(sessionId, db);
+      const saved = setRadioSettings(sessionId, {
+        discoveryRatio: typeof body.discoveryRatio === "number" ? body.discoveryRatio : undefined,
+        biases: body.biases
+      }, db);
+
+      if (sessionId !== "default") {
+        setRadioSettings("default", {
+          discoveryRatio: saved.discoveryRatio,
+          biases: saved.biases
+        }, db);
       }
 
       let updatedQueue: any[] = [];
@@ -395,7 +399,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
 
       return new Response(JSON.stringify({ 
         success: true, 
-        settings: { discoveryRatio: ratio, sessionId }, 
+        settings: { ...saved, sessionId }, 
         queue: updatedQueue 
       }), { headers });
     } catch (e) {
@@ -407,8 +411,8 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     const db = getDb();
     const activeSession = getActiveSession(db);
     const sessionId = url.searchParams.get("session_id") || (activeSession ? activeSession.id : "default");
-    const ratio = getDiscoveryRatio(sessionId, db);
-    return new Response(JSON.stringify({ settings: { discoveryRatio: ratio, sessionId } }), { headers });
+    const settings = getRadioSettings(sessionId, db);
+    return new Response(JSON.stringify({ settings: { ...settings, sessionId } }), { headers });
   }
 
   // 5.8 Update yt-dlp Tooling (P2: Auto/Manual updater)
@@ -450,7 +454,9 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         if (body.count) count = Math.min(50, Math.max(1, parseInt(body.count)));
       } catch {}
 
-      const candidates = findPredictiveCatalogTracks(count);
+      const db = getDb();
+      const settings = getRadioSettings("default", db);
+      const candidates = findPredictiveCatalogTracks(count, db, settings.biases);
       if (candidates.length === 0) {
         return new Response(JSON.stringify({ success: false, message: "Нет доступных новых треков для оцифровки" }), { headers });
       }
