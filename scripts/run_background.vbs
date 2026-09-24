@@ -14,17 +14,19 @@ WshEnv("MUSIK_AUTH_DISABLED") = "1"
 WshEnv("MUSIK_WORKER_AUTOSTART") = "0"
 WshEnv("PATH") = strProjectRoot & "\bin;" & WshEnv("PATH")
 
-' 1. Start Go Core Player (hidden = 0)
-WshShell.Run """" & strProjectRoot & "\bin\musik-player.exe""", 0, False
+WshShell.CurrentDirectory = strProjectRoot
 
-' 2. Start CLAP Embedder Daemon (hidden = 0)
-WshShell.Run """" & strProjectRoot & "\bin\python\python.exe"" """ & strProjectRoot & "\extensions\fetcher\scripts\embedder.py"" --server --port 8790", 0, False
+' 1. Start Go Core Player (hidden)
+WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & strProjectRoot & "\scripts\start_player.ps1""", 0, False
 
-' Wait 2 seconds for core services to bind
-WScript.Sleep 2000
+' 2. Start CLAP Embedder Daemon (hidden)
+WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & strProjectRoot & "\scripts\start_embedder.ps1""", 0, False
 
-' 3. Start Deno Sidecar Gateway (hidden = 0)
-WshShell.Run """" & strProjectRoot & "\bin\deno.exe"" run --allow-net --allow-read --allow-write --allow-run --allow-env --allow-ffi """ & strProjectRoot & "\extensions\fetcher\src\server.ts""", 0, False
+' Wait 2.5 seconds for core services to bind
+WScript.Sleep 2500
+
+' 3. Start Deno Sidecar Gateway (hidden)
+WshShell.Run "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File """ & strProjectRoot & "\scripts\start_server.ps1""", 0, False
 
 ' Wait 2 seconds and open browser
 WScript.Sleep 2000

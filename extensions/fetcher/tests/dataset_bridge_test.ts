@@ -2,7 +2,7 @@
 import { assertEquals, assert } from "@std/assert";
 import { Database } from "@db/sqlite";
 import { initSchema } from "../src/db.ts";
-import { compute12DDistance, find12DCandidates, insertExternal12DTrack, getColdStartSeeds } from "../src/dataset_bridge.ts";
+import { compute12DDistance, find12DCandidates, insertExternal12DTrack, getColdStartSeeds, searchExternalCatalog } from "../src/dataset_bridge.ts";
 import { AcousticFeatures12D } from "../src/types.ts";
 
 Deno.test("DatasetBridge: 12D distance reflects acoustic similarity", () => {
@@ -146,3 +146,62 @@ Deno.test("DatasetBridge: Cold-start seeds and candidate search", () => {
 
   db.close();
 });
+
+Deno.test("DatasetBridge: Global catalog search by artist, title, and query parsing", () => {
+  const db = new Database(":memory:");
+  initSchema(db);
+
+  insertExternal12DTrack({
+    artist: "Queen",
+    title: "Bohemian Rhapsody",
+    album: "A Night at the Opera",
+    genre: "Rock",
+    duration_sec: 355,
+    is_available: true,
+    added_at: "2026-01-01",
+    features: { danceability: 0.4, energy: 0.8, key: 0, loudness: -7, mode: 1, speechiness: 0.05, acousticness: 0.2, instrumentalness: 0, liveness: 0.1, valence: 0.5, tempo: 120 }
+  }, db);
+
+  insertExternal12DTrack({
+    artist: "Queen",
+    title: "Radio Ga Ga",
+    album: "The Works",
+    genre: "Pop Rock",
+    duration_sec: 348,
+    is_available: true,
+    added_at: "2026-01-01",
+    features: { danceability: 0.6, energy: 0.7, key: 0, loudness: -7, mode: 1, speechiness: 0.05, acousticness: 0.2, instrumentalness: 0, liveness: 0.1, valence: 0.5, tempo: 112 }
+  }, db);
+
+  insertExternal12DTrack({
+    artist: "Pink Floyd",
+    title: "Comfortably Numb",
+    album: "The Wall",
+    genre: "Progressive Rock",
+    duration_sec: 382,
+    is_available: true,
+    added_at: "2026-01-01",
+    features: { danceability: 0.4, energy: 0.6, key: 0, loudness: -9, mode: 1, speechiness: 0.03, acousticness: 0.1, instrumentalness: 0.05, liveness: 0.1, valence: 0.3, tempo: 127 }
+  }, db);
+
+  // 1. Search by artist prefix
+  const qArtist = searchExternalCatalog("Queen", 10, 0, db);
+  assertEquals(qArtist.count, 2, "Should find 2 Queen tracks");
+
+  // 2. Search by title prefix
+  const qTitle = searchExternalCatalog("Radio Ga Ga", 10, 0, db);
+  assertEquals(qTitle.count, 1, "Should find Radio Ga Ga");
+  assertEquals(qTitle.tracks[0].title, "Radio Ga Ga");
+
+  // 3. Search by Artist - Title format
+  const qBoth = searchExternalCatalog("Pink Floyd - Comfortably", 10, 0, db);
+  assertEquals(qBoth.count, 1, "Should find Pink Floyd - Comfortably Numb");
+  assertEquals(qBoth.tracks[0].artist, "Pink Floyd");
+
+  // 4. Empty query returns empty
+  const qEmpty = searchExternalCatalog("   ", 10, 0, db);
+  assertEquals(qEmpty.count, 0);
+
+  db.close();
+});
+

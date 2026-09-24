@@ -15,6 +15,16 @@
     setTimeout(() => { t.hidden = true; }, 3500);
   }
 
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
+
   // ==========================================
   // Reusable Parameter Slider Component Class
   // ==========================================
@@ -118,38 +128,44 @@
       if (v === 0) return "❤️ Только любимое (0%)";
       if (v <= 35) return `❤️ Больше любимого (${100 - v}%)`;
       if (v >= 40 && v <= 60) return `⚖️ Баланс 50 / 50`;
-      if (v < 100) return `🧠 Больше открытий (${v}%)`;
+      if (v < 100) return `🚀 Больше открытий (${v}%)`;
       return "🚀 Только новые треки (100%)";
     },
-    onChange: (v) => {
-      clearTimeout(sliderDebounceTimer);
-      sliderDebounceTimer = setTimeout(async () => {
-        try {
-          const res = await fetch(`${API_BASE}/api/v1/radio/settings`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ discoveryRatio: v / 100, sessionId: getDeviceId() })
-          });
-          const data = await res.json();
-          if (data && Array.isArray(data.queue) && data.queue.length > 0) {
-            if (typeof window.renderQueue === "function") {
-              window.renderQueue(data.queue);
-            }
-            setTimeout(updateQueueOrigins, 60);
-          }
-          const msg = v === 0 
-            ? "❤️ Режим: Только любимое" 
-            : v === 100 
-              ? "🚀 Режим: Только новые треки" 
-              : `🎛️ Баланс: ${v}% новых открытий`;
-          toast(msg);
-        } catch {}
-      }, 120);
-    }
+    onChange: () => syncAcousticBiases()
   });
 
   // Acoustic Vector Biases Sliders (12D Vector Steering)
   let biasesDebounceTimer = null;
+
+  async function playTrackNow(trackId) {
+    if (!trackId) return;
+    toast("Запуск трека...");
+    if (typeof window.jumpTo === "function" && window.sessionId) {
+      try {
+        await window.jumpTo(trackId);
+        return;
+      } catch {}
+    }
+    if (typeof window.playFixed === "function") {
+      try {
+        await window.playFixed({ track_id: trackId });
+        return;
+      } catch {}
+    }
+    try {
+      const res = await fetch(`${API_BASE}/api/play`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ track_id: trackId })
+      });
+      const data = await res.json();
+      if (typeof window.applyPlayPayload === "function") {
+        window.applyPlayPayload(data);
+      }
+    } catch (e) {
+      toast("Ошибка воспроизведения: " + String(e));
+    }
+  }
 
   function syncAcousticBiases() {
     clearTimeout(biasesDebounceTimer);
@@ -161,12 +177,13 @@
           acousticness: acousticBiasSlider.getValue() / 100,
           tempo: tempoBiasSlider.getValue() / 100
         };
+        const discRatio = discoveryBalanceSlider.getValue() / 100;
         const res = await fetch(`${API_BASE}/api/v1/radio/settings`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ 
             biases, 
-            discoveryRatio: discoveryBalanceSlider.getValue() / 100,
+            discoveryRatio: discRatio,
             sessionId: getDeviceId() 
           })
         });
@@ -175,6 +192,28 @@
           if (typeof window.renderQueue === "function") {
             window.renderQueue(data.queue);
           }
+          const ol = document.getElementById("queue");
+          if (ol) {
+            ol.innerHTML = "";
+            data.queue.forEach((q) => {
+              const li = document.createElement("li");
+              if (q.track_id) {
+                li.dataset.trackId = String(q.track_id);
+                li.style.cursor = "pointer";
+                li.title = "▶ Нажмите, чтобы включить прямо сейчас";
+                li.onclick = () => playTrackNow(q.track_id);
+              }
+              const tags = [];
+              if (q.explore) tags.push('<span class="tag">far</span>');
+              if (q.new_boost) tags.push('<span class="tag">new</span>');
+              li.innerHTML = `<strong>${escapeHtml(q.artist || "")}</strong> — ${escapeHtml(q.title || "")}${tags.join("")}<span class="why">${escapeHtml(q.explanation || "")}</span>`;
+              ol.appendChild(li);
+            });
+            const qCount = document.getElementById("queue-count");
+            if (qCount) qCount.textContent = String(data.queue.length);
+            const addonQCnt = document.getElementById("addon-queue-cnt");
+            if (addonQCnt) addonQCnt.textContent = String(data.queue.length);
+          }
           setTimeout(updateQueueOrigins, 60);
         }
         
@@ -182,15 +221,19 @@
         const badge = document.getElementById("eq-summary-badge");
         if (badge) {
           const nonZero = [];
+          if (discRatio === 0) nonZero.push("❤️ Любимое 100%");
+          else if (discRatio === 1) nonZero.push("🚀 Новое 100%");
+          else if (discRatio !== 0.5) nonZero.push(`⚖️ ${Math.round(discRatio * 100)}% открытий`);
+
           if (biases.energy !== 0) nonZero.push(biases.energy > 0 ? "⚡ Драйв" : "🌙 Чилл");
           if (biases.valence !== 0) nonZero.push(biases.valence > 0 ? "☀️ Позитив" : "🌧️ Грусть");
           if (biases.acousticness !== 0) nonZero.push(biases.acousticness > 0 ? "🎸 Акустика" : "🎹 Синтетика");
           if (biases.tempo !== 0) nonZero.push(biases.tempo > 0 ? "⏩ Быстрее" : "⏪ Медленнее");
-          badge.textContent = nonZero.length > 0 ? nonZero.join(" • ") : "Нейтрально";
+          badge.textContent = nonZero.length > 0 ? nonZero.join(" • ") : "Нейтрально (50/50)";
           badge.style.color = nonZero.length > 0 ? "#38bdf8" : "#94a3b8";
         }
       } catch {}
-    }, 150);
+    }, 120);
   }
 
   const energyBiasSlider = new CustomAudioSlider({
@@ -1056,7 +1099,7 @@
 
     const sliderEl = discoveryBalanceSlider.render();
 
-    // Create collapsible 12D Acoustic Equalizer
+    // Create unified collapsible 12D Acoustic Equalizer & Discovery Settings
     let eqWrap = document.getElementById("wrap-acoustic-equalizer");
     if (!eqWrap) {
       eqWrap = document.createElement("details");
@@ -1064,41 +1107,68 @@
       eqWrap.style.cssText = "background: rgba(0,0,0,0.32); border: 1px solid rgba(56,189,248,0.25); border-radius: 12px; padding: 6px 10px; margin: 6px 0;";
       eqWrap.innerHTML = `
         <summary style="cursor: pointer; font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; user-select: none;">
-          <span style="display: flex; align-items: center; gap: 6px;">🎛️ Эквалайзер настроения (12D)</span>
-          <span id="eq-summary-badge" style="font-size: 0.72rem; opacity: 0.85; background: rgba(56,189,248,0.15); border: 1px solid rgba(56,189,248,0.3); padding: 1px 6px; border-radius: 6px; color: #94a3b8;">Нейтрально</span>
+          <span style="display: flex; align-items: center; gap: 6px;">🎛️ Настройки настроения и открытий (12D)</span>
+          <span id="eq-summary-badge" style="font-size: 0.72rem; opacity: 0.85; background: rgba(56,189,248,0.15); border: 1px solid rgba(56,189,248,0.3); padding: 1px 6px; border-radius: 6px; color: #94a3b8;">Нейтрально (50/50)</span>
         </summary>
         <div id="eq-sliders-container" style="margin-top: 6px; display: flex; flex-direction: column; gap: 4px;">
-          <!-- 4 Biases Sliders -->
-          <div style="display: flex; justify-content: flex-end; margin-top: 4px;">
+          <!-- 5 Sliders: Discovery Balance + 4 Mood Biases -->
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 6px;">
+            <button type="button" id="btn-play-vibe-now" class="btn primary sm" style="font-size: 0.75rem; padding: 4px 10px; background: #e07a3a; color: #fff; border: none; border-radius: 6px; font-weight: 700; cursor: pointer;">
+              ▶ Включить этот вайб сейчас
+            </button>
             <button type="button" id="btn-reset-eq" class="btn quiet sm" style="font-size: 0.75rem; padding: 2px 8px; color: #94a3b8; border-color: rgba(255,255,255,0.2); cursor: pointer;">
-              ↺ Сбросить в 0 (Нейтраль)
+              ↺ Сбросить (50/50)
             </button>
           </div>
         </div>
       `;
 
       const eqContainer = eqWrap.querySelector("#eq-sliders-container");
-      eqContainer.insertBefore(energyBiasSlider.render(), eqContainer.firstChild);
-      eqContainer.insertBefore(valenceBiasSlider.render(), eqContainer.children[1]);
-      eqContainer.insertBefore(acousticBiasSlider.render(), eqContainer.children[2]);
-      eqContainer.insertBefore(tempoBiasSlider.render(), eqContainer.children[3]);
+      eqContainer.insertBefore(sliderEl, eqContainer.firstChild); // 1. Баланс открытий
+      eqContainer.insertBefore(energyBiasSlider.render(), eqContainer.children[1]); // 2. Энергия
+      eqContainer.insertBefore(valenceBiasSlider.render(), eqContainer.children[2]); // 3. Настроение
+      eqContainer.insertBefore(acousticBiasSlider.render(), eqContainer.children[3]); // 4. Акустика
+      eqContainer.insertBefore(tempoBiasSlider.render(), eqContainer.children[4]); // 5. Темп
+
+      const playVibeBtn = eqWrap.querySelector("#btn-play-vibe-now");
+      if (playVibeBtn) {
+        playVibeBtn.onclick = async () => {
+          playVibeBtn.textContent = "⏳ Применяем...";
+          try {
+            await syncAcousticBiases();
+            if (typeof window.postEvent === "function") {
+              await window.postEvent("skip");
+            } else {
+              const firstLi = document.querySelector("#queue li");
+              if (firstLi && firstLi.dataset.trackId) {
+                await playTrackNow(parseInt(firstLi.dataset.trackId, 10));
+              }
+            }
+            toast("▶ Радио переключено на выбранный вайб!");
+          } catch (e) {
+            toast("Ошибка: " + String(e));
+          } finally {
+            playVibeBtn.textContent = "▶ Включить этот вайб сейчас";
+          }
+        };
+      }
 
       const resetBtn = eqWrap.querySelector("#btn-reset-eq");
       if (resetBtn) {
         resetBtn.onclick = () => {
+          discoveryBalanceSlider.setValue(50);
           energyBiasSlider.setValue(0);
           valenceBiasSlider.setValue(0);
           acousticBiasSlider.setValue(0);
           tempoBiasSlider.setValue(0);
           syncAcousticBiases();
-          toast("↺ Настройки настроения сброшены в нейтраль");
+          toast("↺ Настройки сброшены в нейтральный баланс 50/50");
         };
       }
     }
 
     const container = document.createElement("div");
     container.id = "addon-sliders-block";
-    container.appendChild(sliderEl);
     container.appendChild(eqWrap);
 
     const tabBar = document.getElementById("addon-queue-tab-bar");
@@ -1488,23 +1558,26 @@
     const playlistEl = document.getElementById("playlist");
     const queueEl = document.getElementById("queue");
 
-    // 1. Create Tab Bar
+    // 1. Create Tab Bar (Queue, History, 3.2M Catalog)
     const tabBar = document.createElement("div");
     tabBar.id = "addon-queue-tab-bar";
-    tabBar.style.cssText = "display:flex; gap:6px; margin:4px 0 10px 0; background:rgba(0,0,0,0.25); padding:3px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);";
+    tabBar.style.cssText = "display:flex; gap:5px; margin:4px 0 10px 0; background:rgba(0,0,0,0.28); padding:3px; border-radius:12px; border:1px solid rgba(255,255,255,0.08);";
 
     tabBar.innerHTML = `
-      <button type="button" id="addon-tab-queue" style="flex:1; padding:6px 10px; border:none; border-radius:9px; background:rgba(224,122,58,0.22); color:#f7f0e8; font-size:0.82rem; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px; transition:all 0.2s;">
+      <button type="button" id="addon-tab-queue" style="flex:1; padding:6px 6px; border:none; border-radius:9px; background:rgba(224,122,58,0.22); color:#f7f0e8; font-size:0.80rem; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:4px; transition:all 0.2s;">
         <span>⏭ Очередь</span>
-        <span id="addon-queue-cnt" style="background:rgba(224,122,58,0.35); color:#fff; padding:1px 6px; border-radius:10px; font-size:0.72rem;">0</span>
+        <span id="addon-queue-cnt" style="background:rgba(224,122,58,0.35); color:#fff; padding:1px 5px; border-radius:10px; font-size:0.70rem;">0</span>
       </button>
-      <button type="button" id="addon-tab-history" style="flex:1; padding:6px 10px; border:none; border-radius:9px; background:transparent; color:var(--muted,#a89f91); font-size:0.82rem; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:6px; transition:all 0.2s;">
-        <span>⏮ Прослушано</span>
-        <span id="addon-hist-cnt" style="background:rgba(56,189,248,0.2); color:#38bdf8; padding:1px 6px; border-radius:10px; font-size:0.72rem;">0</span>
+      <button type="button" id="addon-tab-history" style="flex:1; padding:6px 6px; border:none; border-radius:9px; background:transparent; color:var(--muted,#a89f91); font-size:0.80rem; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:4px; transition:all 0.2s;">
+        <span>⏮ История</span>
+        <span id="addon-hist-cnt" style="background:rgba(56,189,248,0.2); color:#38bdf8; padding:1px 5px; border-radius:10px; font-size:0.70rem;">0</span>
+      </button>
+      <button type="button" id="addon-tab-catalog" style="flex:1.15; padding:6px 6px; border:none; border-radius:9px; background:transparent; color:var(--muted,#a89f91); font-size:0.80rem; font-weight:600; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:4px; transition:all 0.2s;" title="Поиск по 3.27 млн треков с моментальным стримингом">
+        <span>🔍 Каталог 3.2M</span>
       </button>
     `;
 
-    // 2. Create Search Box
+    // 2. Create History Search Box & List
     const searchWrap = document.createElement("div");
     searchWrap.id = "addon-hist-search-wrap";
     searchWrap.style.cssText = "display:none; margin: 4px 0 8px 0;";
@@ -1521,13 +1594,11 @@
       };
     }
 
-    // 3. Create History List
     const historyList = document.createElement("ol");
     historyList.id = "addon-history-list";
     historyList.className = "playlist";
     historyList.style.display = "none";
 
-    // Infinite scroll listener
     historyList.onscroll = () => {
       if (historyList.scrollTop + historyList.clientHeight >= historyList.scrollHeight - 80) {
         if (displayedHistoryCount < cachedFullHistory.length) {
@@ -1536,6 +1607,234 @@
         }
       }
     };
+
+    // 3. Create 3.2M Catalog Search Box & List
+    const catalogWrap = document.createElement("div");
+    catalogWrap.id = "addon-cat-search-wrap";
+    catalogWrap.style.cssText = "display:none; margin: 4px 0 8px 0;";
+    catalogWrap.innerHTML = `
+      <div style="position:relative; display:flex; align-items:center;">
+        <input type="search" id="addon-cat-search-input" placeholder="🔍 Поиск трека или артиста (Queen, Hans Zimmer, Rock)..." style="width:100%; box-sizing:border-box; padding:7px 30px 7px 12px; border-radius:10px; background:rgba(0,0,0,0.45); border:1px solid rgba(234,179,8,0.35); color:#f7f0e8; font-size:0.82rem; outline:none;" />
+        <span id="addon-cat-spinner" style="position:absolute; right:10px; font-size:0.75rem; display:none;">⚡</span>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin:5px 2px 2px 2px; font-size:0.72rem; color:var(--muted,#a89f91);">
+        <span>⚡ 3,277,692 трека · Поиск ~2 мс</span>
+        <button type="button" id="btn-trigger-online-search" class="btn quiet sm" style="font-size:0.70rem; padding:1px 8px; border-radius:6px; color:#38bdf8; background:rgba(56,189,248,0.12); border:1px solid rgba(56,189,248,0.25); cursor:pointer;" title="Искать в Google & YouTube Music">🌐 Google Music</button>
+      </div>
+      <div id="addon-cat-chips" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:6px;">
+        <span style="font-size:0.70rem; color:var(--muted,#a89f91); padding:2px 0;">Примеры:</span>
+        <button type="button" class="btn quiet sm addon-cat-chip" data-q="Queen" style="padding:1px 6px; font-size:0.70rem; border-radius:6px; cursor:pointer;">Queen</button>
+        <button type="button" class="btn quiet sm addon-cat-chip" data-q="Hans Zimmer" style="padding:1px 6px; font-size:0.70rem; border-radius:6px; cursor:pointer;">Hans Zimmer</button>
+        <button type="button" class="btn quiet sm addon-cat-chip" data-q="Metallica" style="padding:1px 6px; font-size:0.70rem; border-radius:6px; cursor:pointer;">Metallica</button>
+        <button type="button" class="btn quiet sm addon-cat-chip" data-q="Daft Punk" style="padding:1px 6px; font-size:0.70rem; border-radius:6px; cursor:pointer;">Daft Punk</button>
+        <button type="button" class="btn quiet sm addon-cat-chip" data-q="Chopin" style="padding:1px 6px; font-size:0.70rem; border-radius:6px; cursor:pointer;">Chopin</button>
+      </div>
+    `;
+
+    const catalogList = document.createElement("ol");
+    catalogList.id = "addon-catalog-list";
+    catalogList.className = "playlist";
+    catalogList.style.display = "none";
+
+    let catDebounceTimer = null;
+    const catInput = catalogWrap.querySelector("#addon-cat-search-input");
+    const catSpinner = catalogWrap.querySelector("#addon-cat-spinner");
+    const catStat = catalogWrap.querySelector("#addon-cat-stat");
+    const chipsWrap = catalogWrap.querySelector("#addon-cat-chips");
+    const triggerOnlineBtn = catalogWrap.querySelector("#btn-trigger-online-search");
+
+    if (triggerOnlineBtn) {
+      triggerOnlineBtn.onclick = () => {
+        const val = catInput ? catInput.value.trim() : "";
+        if (val) performOnlineSearch(val);
+        else toast("Введите запрос для поиска в Google Music");
+      };
+    }
+
+    async function performOnlineSearch(q) {
+      q = (q || (catInput ? catInput.value : "")).trim();
+      if (!q) return;
+      if (catSpinner) catSpinner.style.display = "inline";
+      if (catStat) catStat.textContent = `🌐 Поиск в Google / YouTube Music...`;
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/catalog/search-online?q=${encodeURIComponent(q)}&limit=10`);
+        const data = await res.json();
+        if (catSpinner) catSpinner.style.display = "none";
+        if (catStat) catStat.textContent = `Google Music: ${data.count || 0} треков`;
+
+        if (!data.tracks || data.tracks.length === 0) {
+          catalogList.innerHTML = `<li style="padding:18px 10px; text-align:center; color:var(--muted,#a89f91); font-size:0.82rem; list-style:none;">В Google Music ничего не найдено по «${escapeHtml(q)}».</li>`;
+          return;
+        }
+
+        renderCatalogList(data.tracks.map(t => ({
+          ...t,
+          genre: "Google / YT Music",
+          is_online: true
+        })));
+      } catch (err) {
+        if (catSpinner) catSpinner.style.display = "none";
+        catalogList.innerHTML = `<li style="padding:12px 10px; text-align:center; color:#f87171; font-size:0.80rem; list-style:none;">Ошибка онлайн-поиска: ${err.message}</li>`;
+      }
+    }
+
+    async function performCatalogSearch(q) {
+      q = (q || "").trim();
+      if (!q) {
+        catalogList.innerHTML = `<li style="padding:16px 10px; text-align:center; color:var(--muted,#a89f91); font-size:0.80rem; list-style:none;">Введите название трека или артиста для мгновенного поиска по базе 3.27 млн треков или нажмите кнопку 🌐 Google Music.</li>`;
+        if (catStat) catStat.textContent = "";
+        return;
+      }
+      if (catSpinner) catSpinner.style.display = "inline";
+
+      const startTime = performance.now();
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/catalog/search?q=${encodeURIComponent(q)}&limit=50`);
+        const data = await res.json();
+        const duration = Math.round(performance.now() - startTime);
+
+        if (catSpinner) catSpinner.style.display = "none";
+        const count = data.count || 0;
+        if (catStat) catStat.textContent = `Найдено: ${count} (${duration} мс)`;
+
+        if (!data.tracks || data.tracks.length === 0) {
+          catalogList.innerHTML = `
+            <li style="padding:18px 10px; text-align:center; color:var(--muted,#a89f91); font-size:0.82rem; list-style:none;">
+              <div>В локальной базе 3.27M ничего не найдено по «${escapeHtml(q)}».</div>
+              <div style="margin-top:12px;">
+                <button type="button" id="btn-empty-online-search" class="btn quiet sm" style="padding:6px 14px; border-radius:99px; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.4); color:#38bdf8; font-weight:700; cursor:pointer;">
+                  🌐 Искать в Google / YouTube Music
+                </button>
+              </div>
+            </li>
+          `;
+          const emptyBtn = catalogList.querySelector("#btn-empty-online-search");
+          if (emptyBtn) emptyBtn.onclick = () => performOnlineSearch(q);
+          return;
+        }
+
+        renderCatalogList(data.tracks);
+      } catch (err) {
+        if (catSpinner) catSpinner.style.display = "none";
+        catalogList.innerHTML = `<li style="padding:12px 10px; text-align:center; color:#f87171; font-size:0.80rem; list-style:none;">Ошибка поиска: ${err.message}</li>`;
+      }
+    }
+
+    function renderCatalogList(tracks) {
+      catalogList.innerHTML = tracks.map(t => {
+        let genreBadge = t.is_online 
+          ? `<span style="background:rgba(56,189,248,0.18); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;">🌐 Google Music</span>`
+          : (t.genre ? `<span style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:5px; font-size:0.68rem; color:#cbd5e1;">${escapeHtml(t.genre)}</span>` : "");
+        let acousticBadge = typeof t.energy === "number" ? `<span style="color:#fbbf24; font-size:0.68rem;" title="Энергия: ${t.energy}%, Темп: ${t.tempo || 'н/д'} BPM">⚡ ${t.energy}%</span>` : "";
+        let localBadge = t.is_local ? `<span style="background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid rgba(34,197,94,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;" title="Трек уже в локальной коллекции">💿 В коллекции</span>` : "";
+        let acousticBadge = typeof t.energy === "number" ? `<span style="color:#fbbf24; font-size:0.68rem;" title="Энергия: ${t.energy}%, Темп: ${t.tempo || 'н/д'} BPM">⚡ ${t.energy}%</span>` : "";
+        let localBadge = t.is_local ? `<span style="background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid rgba(34,197,94,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;" title="Трек уже в локальной коллекции">💿 В коллекции</span>` : "";
+
+        return `
+          <li class="addon-catalog-item" data-id="${t.id}" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-album="${escapeHtml(t.album)}" data-duration="${t.duration_sec}" style="display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; margin-bottom:3px; cursor:pointer; transition:background 0.15s; background:rgba(255,255,255,0.02); border-bottom:1px solid rgba(255,255,255,0.04);">
+            <div class="addon-play-icon" style="color:var(--muted,#a89f91); font-size:0.88rem; width:18px; text-align:center; flex-shrink:0; transition:transform 0.15s, color 0.15s;" title="Слушать сейчас">
+              ▶
+            </div>
+            <div style="flex:1; min-width:0; display:flex; flex-direction:column; gap:2px;">
+              <div style="font-weight:600; font-size:0.86rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--fg,#f7f0e8);">
+                ${escapeHtml(t.title)}
+              </div>
+              <div style="font-size:0.75rem; color:var(--muted,#a89f91); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; display:flex; align-items:center; gap:6px;">
+                <span style="overflow:hidden; text-overflow:ellipsis;">${escapeHtml(t.artist)}</span>
+                ${genreBadge}
+                ${acousticBadge}
+                ${localBadge}
+              </div>
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;" class="addon-cat-actions">
+              <span style="font-size:0.74rem; color:var(--muted,#a89f91); font-variant-numeric:tabular-nums;">${fmtTime(t.duration_sec)}</span>
+              <button type="button" class="addon-btn-cat-queue" title="Добавить в очередь" style="background:transparent; border:none; cursor:pointer; font-size:1.05rem; padding:2px 4px; color:rgba(255,255,255,0.4); line-height:1; transition:all 0.15s;">＋</button>
+            </div>
+          </li>
+        `;
+      }).join("");
+
+      // Bind play and queue clicks
+      catalogList.querySelectorAll(".addon-catalog-item").forEach(itemEl => {
+        const artist = itemEl.dataset.artist || "";
+        const title = itemEl.dataset.title || "";
+        const album = itemEl.dataset.album || "";
+        const duration_sec = parseInt(itemEl.dataset.duration || "180", 10);
+        const id = parseInt(itemEl.dataset.id || "0", 10);
+
+        itemEl.onclick = async (e) => {
+          if (e.target.closest(".addon-cat-actions")) return;
+          try {
+            toast(`⚡ Запуск из базы 3.2M: ${artist} - ${title}...`);
+            const res = await fetch(`${API_BASE}/api/v1/catalog/play`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ artist, title, album, duration_sec, id })
+            });
+            const data = await res.json();
+            if (data.success && data.track_id) {
+              playHistoryTrack(data.track_id, `${artist} - ${title}`);
+            } else {
+              toast("Ошибка запуска: " + (data.error || "не удалось запустить"));
+            }
+          } catch (err) {
+            toast("Ошибка: " + err.message);
+          }
+        };
+
+        const qBtn = itemEl.querySelector(".addon-btn-cat-queue");
+        if (qBtn) {
+          qBtn.onclick = async (e) => {
+            e.stopPropagation();
+            qBtn.style.opacity = "0.5";
+            try {
+              const res = await fetch(`${API_BASE}/api/v1/catalog/queue`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ artist, title, album, duration_sec, id })
+              });
+              const data = await res.json();
+              if (data.success) {
+                qBtn.textContent = "✓";
+                qBtn.style.color = "#22c55e";
+                toast(`+ Добавлено в очередь: ${title}`);
+                if (typeof window.renderQueue === "function" && Array.isArray(data.queue)) {
+                  window.renderQueue(data.queue);
+                }
+                setTimeout(() => {
+                  qBtn.textContent = "＋";
+                  qBtn.style.color = "rgba(255,255,255,0.4)";
+                  qBtn.style.opacity = "1";
+                }, 2000);
+              }
+            } catch (err) {
+              toast("Ошибка: " + err.message);
+              qBtn.style.opacity = "1";
+            }
+          };
+        }
+      });
+    }
+
+    if (catInput) {
+      catInput.oninput = (e) => {
+        clearTimeout(catDebounceTimer);
+        const val = e.target.value.trim();
+        catDebounceTimer = setTimeout(() => performCatalogSearch(val), 200);
+      };
+    }
+
+    if (chipsWrap) {
+      chipsWrap.querySelectorAll(".addon-cat-chip").forEach(btn => {
+        btn.onclick = () => {
+          const q = btn.dataset.q || btn.textContent.trim();
+          if (catInput) {
+            catInput.value = q;
+            performCatalogSearch(q);
+          }
+        };
+      });
+    }
 
     // Insert Elements into queuePanel
     if (queueHead && queueHead.nextSibling) {
@@ -1546,10 +1845,13 @@
 
     queuePanel.insertBefore(searchWrap, queueEl ? queueEl.nextSibling : null);
     queuePanel.insertBefore(historyList, searchWrap.nextSibling);
+    queuePanel.insertBefore(catalogWrap, historyList.nextSibling);
+    queuePanel.insertBefore(catalogList, catalogWrap.nextSibling);
 
     // Tab switcher actions
     const tabQ = document.getElementById("addon-tab-queue");
     const tabH = document.getElementById("addon-tab-history");
+    const tabC = document.getElementById("addon-tab-catalog");
 
     tabQ.onclick = () => {
       activeQueueTab = "queue";
@@ -1557,9 +1859,15 @@
       tabQ.style.color = "#f7f0e8";
       tabH.style.background = "transparent";
       tabH.style.color = "var(--muted,#a89f91)";
+      if (tabC) {
+        tabC.style.background = "transparent";
+        tabC.style.color = "var(--muted,#a89f91)";
+      }
 
       searchWrap.style.display = "none";
       historyList.style.display = "none";
+      catalogWrap.style.display = "none";
+      catalogList.style.display = "none";
       if (playlistEl) playlistEl.style.removeProperty("display");
       if (queueEl) queueEl.style.removeProperty("display");
     };
@@ -1570,14 +1878,44 @@
       tabH.style.color = "#38bdf8";
       tabQ.style.background = "transparent";
       tabQ.style.color = "var(--muted,#a89f91)";
+      if (tabC) {
+        tabC.style.background = "transparent";
+        tabC.style.color = "var(--muted,#a89f91)";
+      }
 
       if (playlistEl) playlistEl.style.display = "none";
       if (queueEl) queueEl.style.display = "none";
+      catalogWrap.style.display = "none";
+      catalogList.style.display = "none";
       searchWrap.style.display = "block";
       historyList.style.display = "block";
 
       loadRadioHistory();
     };
+
+    if (tabC) {
+      tabC.onclick = () => {
+        activeQueueTab = "catalog";
+        tabC.style.background = "rgba(234,179,8,0.22)";
+        tabC.style.color = "#fbbf24";
+        tabQ.style.background = "transparent";
+        tabQ.style.color = "var(--muted,#a89f91)";
+        tabH.style.background = "transparent";
+        tabH.style.color = "var(--muted,#a89f91)";
+
+        if (playlistEl) playlistEl.style.display = "none";
+        if (queueEl) queueEl.style.display = "none";
+        searchWrap.style.display = "none";
+        historyList.style.display = "none";
+        catalogWrap.style.display = "block";
+        catalogList.style.display = "block";
+
+        if (catInput && !catInput.value.trim()) {
+          catInput.focus();
+          performCatalogSearch("");
+        }
+      };
+    }
 
     // Auto-refresh history, origin badges, and queue on track events
     const audioEl = document.getElementById("audio");
@@ -1623,12 +1961,21 @@
     updateNowPlayingOrigin();
     updateQueueOrigins();
 
-    // Keep history tab state consistent and refresh badge
+    // Keep active tab state consistent
     if (activeQueueTab === "history") {
       const p = document.getElementById("playlist");
       const q = document.getElementById("queue");
       if (p) p.style.display = "none";
       if (q) q.style.display = "none";
+    } else if (activeQueueTab === "catalog") {
+      const p = document.getElementById("playlist");
+      const q = document.getElementById("queue");
+      if (p) p.style.display = "none";
+      if (q) q.style.display = "none";
+      const hWrap = document.getElementById("addon-hist-search-wrap");
+      const hList = document.getElementById("addon-history-list");
+      if (hWrap) hWrap.style.display = "none";
+      if (hList) hList.style.display = "none";
     }
     loadRadioHistory();
   }, 2000);

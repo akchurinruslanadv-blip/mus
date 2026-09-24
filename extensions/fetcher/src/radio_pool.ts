@@ -1,11 +1,11 @@
 // extensions/fetcher/src/radio_pool.ts: Speculative Pre-Indexing Pool for Zero-Latency Radio
 import { config } from "./config.ts";
-import { getDb, getActiveSession, findTrackByArtistTitle, has512Embedding } from "./db.ts";
+import { getDb, getActiveSession, findTrackByArtistTitle, has512Embedding, getRadioSettings } from "./db.ts";
 import { find12DCandidates, getColdStartSeeds } from "./dataset_bridge.ts";
 import { fetchTrackAudio } from "./fetcher.ts";
 import { compute512DEmbedding } from "./embedder_client.ts";
 import { enforceLruCache } from "./lru.ts";
-import { RadioPoolCandidate, AcousticFeatures12D } from "./types.ts";
+import { RadioPoolCandidate, AcousticFeatures12D, AcousticBiases } from "./types.ts";
 
 export class RadioPoolManager {
   private pool: RadioPoolCandidate[] = [];
@@ -43,7 +43,13 @@ export class RadioPoolManager {
     return [...this.pool];
   }
 
-  public async maintainPool(): Promise<void> {
+  public async refreshPool(biases?: AcousticBiases): Promise<void> {
+    this.pool = [];
+    this.isBusy = false;
+    await this.maintainPool(biases);
+  }
+
+  public async maintainPool(biases?: AcousticBiases): Promise<void> {
     if (this.isBusy || !this.isManaging || this.isProcessing) return;
     this.isBusy = true;
 
@@ -69,7 +75,7 @@ export class RadioPoolManager {
 
       // If pool is below target size, replenish with fresh acoustic candidates
       if (this.pool.length < this.targetPoolSize) {
-        await this.replenishPool(session);
+        await this.replenishPool(session, biases);
       }
 
       // Process next unindexed candidate in pool (one at a time)
@@ -87,7 +93,7 @@ export class RadioPoolManager {
     }
   }
 
-  private async replenishPool(session: ReturnType<typeof getActiveSession>): Promise<void> {
+  private async replenishPool(session: ReturnType<typeof getActiveSession>, biases?: AcousticBiases): Promise<void> {
     const db = getDb();
     const excludeSet = new Set<string>();
 
@@ -102,6 +108,9 @@ export class RadioPoolManager {
         }
       }
     }
+
+    // Read active biases if not passed
+    const activeBiases = biases || (session?.id ? getRadioSettings(session.id, db).biases : undefined);
 
     // Determine current acoustic seed
     let seedFeatures: AcousticFeatures12D | undefined;
@@ -139,7 +148,7 @@ export class RadioPoolManager {
     }
 
     const needed = this.targetPoolSize - this.pool.length;
-    const candidates = find12DCandidates(seedFeatures, needed * 2, excludeSet, db);
+    const candidates = find12DCandidates(seedFeatures, needed * 2, excludeSet, db, activeBiases);
 
     for (const hit of candidates) {
       if (this.pool.length >= this.targetPoolSize) break;

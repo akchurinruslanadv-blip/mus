@@ -53,20 +53,75 @@ export function find12DCandidates(
   const countRow = db.prepare(`SELECT count(*) as c FROM external_catalog WHERE is_available = 1`).get() as { c?: number } | undefined;
   const total = countRow?.c || 0;
 
-  let rows: RowType[];
-  if (total > 800) {
+  const hasActiveBiases = biases && (
+    (biases.energy && Math.abs(biases.energy) > 0.04) ||
+    (biases.valence && Math.abs(biases.valence) > 0.04) ||
+    (biases.acousticness && Math.abs(biases.acousticness) > 0.04) ||
+    (biases.tempo && Math.abs(biases.tempo) > 0.04)
+  );
+
+  const conditions = ["is_available = 1"];
+  if (biases) {
+    if (biases.energy && biases.energy > 0.05) {
+      const minEnergy = Math.min(0.85, Math.max(0.55, effectiveSeed.energy - 0.15));
+      conditions.push(`json_extract(features_json, '$.energy') >= ${minEnergy.toFixed(2)}`);
+    } else if (biases.energy && biases.energy < -0.05) {
+      const maxEnergy = Math.max(0.20, Math.min(0.50, effectiveSeed.energy + 0.15));
+      conditions.push(`json_extract(features_json, '$.energy') <= ${maxEnergy.toFixed(2)}`);
+    }
+
+    if (biases.acousticness && biases.acousticness > 0.05) {
+      const minAcoustic = Math.min(0.80, Math.max(0.40, effectiveSeed.acousticness - 0.15));
+      conditions.push(`json_extract(features_json, '$.acousticness') >= ${minAcoustic.toFixed(2)}`);
+    } else if (biases.acousticness && biases.acousticness < -0.05) {
+      const maxAcoustic = Math.max(0.10, Math.min(0.25, effectiveSeed.acousticness + 0.10));
+      conditions.push(`json_extract(features_json, '$.acousticness') <= ${maxAcoustic.toFixed(2)}`);
+    }
+
+    if (biases.valence && biases.valence > 0.05) {
+      const minValence = Math.min(0.80, Math.max(0.55, effectiveSeed.valence - 0.15));
+      conditions.push(`json_extract(features_json, '$.valence') >= ${minValence.toFixed(2)}`);
+    } else if (biases.valence && biases.valence < -0.05) {
+      const maxValence = Math.max(0.20, Math.min(0.42, effectiveSeed.valence + 0.15));
+      conditions.push(`json_extract(features_json, '$.valence') <= ${maxValence.toFixed(2)}`);
+    }
+
+    if (biases.tempo && biases.tempo > 0.05) {
+      const minTempo = Math.min(160, Math.max(120, effectiveSeed.tempo - 15));
+      conditions.push(`json_extract(features_json, '$.tempo') >= ${Math.round(minTempo)}`);
+    } else if (biases.tempo && biases.tempo < -0.05) {
+      const maxTempo = Math.max(70, Math.min(105, effectiveSeed.tempo + 15));
+      conditions.push(`json_extract(features_json, '$.tempo') <= ${Math.round(maxTempo)}`);
+    }
+  }
+
+  let rows: RowType[] = [];
+  if (total > 1000) {
+    // Pick a random starting point across the 3.27M catalog to ensure infinite variety on every slider adjustment
+    const randomStartId = Math.floor(Math.random() * Math.max(1, total - 12000));
     rows = db.prepare(`
       SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
       FROM external_catalog
-      WHERE is_available = 1 AND id IN (
-        SELECT abs(random() % ?) + 1 FROM external_catalog LIMIT 600
-      )
-    `).all(total) as RowType[];
+      WHERE id >= ? AND ${conditions.join(" AND ")}
+      LIMIT 400
+    `).all(randomStartId) as RowType[];
+
+    // If near the tail of the table or very strict condition, wrap around to head
+    if (rows.length < 60) {
+      const wrapRows = db.prepare(`
+        SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
+        FROM external_catalog
+        WHERE ${conditions.join(" AND ")}
+        LIMIT 400
+      `).all() as RowType[];
+      rows.push(...wrapRows);
+    }
   } else {
     rows = db.prepare(`
       SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
       FROM external_catalog
-      WHERE is_available = 1
+      WHERE ${conditions.join(" AND ")}
+      LIMIT 400
     `).all() as RowType[];
   }
 
@@ -98,6 +153,29 @@ export function find12DCandidates(
 
   return scored.slice(0, limit).map(item => {
     const sim = Math.max(0, Math.min(1, 1 - (item.dist / 2.5)));
+    const energyPct = Math.round(item.features.energy * 100);
+    const tempoVal = Math.round(item.features.tempo);
+    const acousticPct = Math.round(item.features.acousticness * 100);
+    const valencePct = Math.round(item.features.valence * 100);
+
+    let reason = `12D сходство (Драйв ${energyPct}%, ${tempoVal} BPM)`;
+    if (biases) {
+      const parts: string[] = [];
+      if (biases.energy && biases.energy > 0.05) parts.push(`⚡ Драйв ${energyPct}%`);
+      else if (biases.energy && biases.energy < -0.05) parts.push(`🌙 Чилл ${energyPct}%`);
+
+      if (biases.acousticness && biases.acousticness > 0.05) parts.push(`🎸 Акустика ${acousticPct}%`);
+      else if (biases.acousticness && biases.acousticness < -0.05) parts.push(`🎹 Электроника`);
+
+      if (biases.valence && biases.valence > 0.05) parts.push(`☀️ Позитив ${valencePct}%`);
+      else if (biases.valence && biases.valence < -0.05) parts.push(`🌧️ Меланхолия ${valencePct}%`);
+
+      if (biases.tempo && Math.abs(biases.tempo) > 0.05) parts.push(`⏱️ ${tempoVal} BPM`);
+
+      if (parts.length > 0) {
+        reason = parts.join(" · ");
+      }
+    }
     return {
       artist: item.track.artist,
       title: item.track.title,
@@ -106,7 +184,7 @@ export function find12DCandidates(
       ytdlId: item.track.ytdl_id,
       similarity: Math.round(sim * 100) / 100,
       features: item.features,
-      reason: `Matching acoustic energy (${Math.round(item.features.energy * 100)}%) and tempo (${Math.round(item.features.tempo)} BPM)`
+      reason
     };
   });
 }
@@ -334,3 +412,136 @@ export function findPredictiveCatalogTracks(
     score: Math.round(Math.max(0, Math.min(1, 1 - (s.dist / 2.5))) * 100) / 100
   }));
 }
+
+export interface CatalogSearchResult {
+  id: number;
+  artist: string;
+  title: string;
+  album: string;
+  genre: string;
+  duration_sec: number;
+  energy?: number;
+  tempo?: number;
+  valence?: number;
+  is_local?: boolean;
+  track_id?: number;
+}
+
+// Global Instant Search across 3.27M catalog tracks
+export function searchExternalCatalog(
+  rawQuery: string,
+  limit = 40,
+  offset = 0,
+  db = getDb()
+): { count: number; tracks: CatalogSearchResult[] } {
+  const q = rawQuery.trim();
+  if (!q) {
+    return { count: 0, tracks: [] };
+  }
+
+  type CatRow = {
+    id: number;
+    artist: string;
+    title: string;
+    album: string;
+    genre: string;
+    duration_sec: number;
+    features_json: string;
+  };
+
+  let rows: CatRow[] = [];
+
+  // Check if query is formatted as "Artist - Title"
+  if (q.includes(" - ")) {
+    const parts = q.split(" - ");
+    const artistPrefix = parts[0].trim() + "%";
+    const titlePrefix = parts.slice(1).join(" - ").trim() + "%";
+    rows = db.prepare(`
+      SELECT id, artist, title, album, genre, duration_sec, features_json
+      FROM external_catalog
+      WHERE artist LIKE ? AND title LIKE ? AND is_available = 1
+      LIMIT ? OFFSET ?
+    `).all(artistPrefix, titlePrefix, limit, offset) as CatRow[];
+  } else {
+    // 1. Instant prefix match on artist or title (hits idx_ext_cat_artist_nocase & idx_ext_cat_title_nocase)
+    const prefix = q + "%";
+    rows = db.prepare(`
+      SELECT id, artist, title, album, genre, duration_sec, features_json
+      FROM external_catalog
+      WHERE (artist LIKE ? OR title LIKE ?) AND is_available = 1
+      LIMIT ? OFFSET ?
+    `).all(prefix, prefix, limit, offset) as CatRow[];
+
+    // 2. If fewer results than desired and query length >= 3, supplement with word boundary match '% q%'
+    if (rows.length < limit && q.length >= 3 && offset === 0) {
+      const existingIds = new Set(rows.map(r => r.id));
+      const wordMatch = "% " + q + "%";
+      const remainingLimit = limit - rows.length;
+      const extraRows = db.prepare(`
+        SELECT id, artist, title, album, genre, duration_sec, features_json
+        FROM external_catalog
+        WHERE (artist LIKE ? OR title LIKE ?) AND is_available = 1
+        LIMIT ?
+      `).all(wordMatch, wordMatch, remainingLimit) as CatRow[];
+
+      for (const r of extraRows) {
+        if (!existingIds.has(r.id)) {
+          rows.push(r);
+          existingIds.add(r.id);
+        }
+      }
+    }
+  }
+
+  let hasTracksTable = true;
+  try {
+    hasTracksTable = !!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='tracks'").get();
+  } catch {
+    hasTracksTable = false;
+  }
+
+  // Check local availability in `tracks` table for each result
+  const tracks: CatalogSearchResult[] = [];
+  for (const r of rows) {
+    let energy: number | undefined;
+    let tempo: number | undefined;
+    let valence: number | undefined;
+
+    if (r.features_json) {
+      try {
+        const feat = JSON.parse(r.features_json);
+        energy = feat.energy;
+        tempo = feat.tempo;
+        valence = feat.valence;
+      } catch {}
+    }
+
+    let local: { id: number } | undefined;
+    if (hasTracksTable) {
+      try {
+        local = db.prepare(`
+          SELECT id FROM tracks 
+          WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+          LIMIT 1
+        `).get(r.artist, r.title) as { id: number } | undefined;
+      } catch {}
+    }
+
+    tracks.push({
+      id: r.id,
+      artist: r.artist,
+      title: r.title,
+      album: r.album || "External Catalog",
+      genre: r.genre || "General",
+      duration_sec: Math.round(r.duration_sec || 180),
+      energy: typeof energy === "number" ? Math.round(energy * 100) : undefined,
+      tempo: typeof tempo === "number" ? Math.round(tempo) : undefined,
+      valence: typeof valence === "number" ? Math.round(valence * 100) : undefined,
+      is_local: !!local,
+      track_id: local?.id
+    });
+  }
+
+  return { count: tracks.length, tracks };
+}
+

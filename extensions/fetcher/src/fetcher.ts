@@ -285,3 +285,66 @@ export async function updateYtDlp(): Promise<{ success: boolean; version?: strin
   }
 }
 
+// Online search fallback across Google & YouTube Music via yt-dlp
+export async function searchOnlineTracks(
+  query: string,
+  limit = 8
+): Promise<{ id: string; title: string; artist: string; duration_sec: number; url: string }[]> {
+  const env: Record<string, string> = {
+    ...Deno.env.toObject(),
+    PATH: `${config.binDir};${Deno.env.get("PATH") || ""}`,
+    PYTHONIOENCODING: "utf-8",
+    PYTHONUTF8: "1"
+  };
+
+  const args = [
+    "--no-playlist",
+    "--socket-timeout", "10",
+    "--encoding", "utf-8",
+    "--no-warnings",
+    `ytsearch${limit}:${query} audio`,
+    "--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s"
+  ];
+
+  try {
+    const cmd = new Deno.Command(config.ytdlpPath, { args, env, stdout: "piped", stderr: "piped" });
+    const { code, stdout } = await cmd.output();
+    if (code !== 0) return [];
+
+    const text = new TextDecoder().decode(stdout).trim();
+    if (!text) return [];
+
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    const results = [];
+    for (const line of lines) {
+      const parts = line.split("|||");
+      if (parts.length < 3) continue;
+      const ytdlId = parts[0].trim();
+      let title = parts[1].trim();
+      let artist = parts[2].trim();
+      const dur = parseFloat(parts[3] || "180");
+
+      if (title.includes(" - ")) {
+        const p = title.split(" - ");
+        artist = p[0].trim();
+        title = p.slice(1).join(" - ").trim();
+      }
+
+      // Strip common suffixes
+      title = title.replace(/\s*[\(\[](?:Official\s*(?:Music\s*)?Video|Audio|Lyrics|Official\s*Audio|Official|Lyric\s*Video)[\)\]]/gi, "").trim();
+
+      results.push({
+        id: ytdlId,
+        title: title || parts[1].trim(),
+        artist: artist || parts[2].trim(),
+        duration_sec: Math.round(dur),
+        url: `https://www.youtube.com/watch?v=${ytdlId}`
+      });
+    }
+    return results;
+  } catch {
+    return [];
+  }
+}
+
+

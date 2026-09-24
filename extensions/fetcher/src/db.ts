@@ -93,6 +93,16 @@ export function initSchema(db: Database): void {
   `).run();
 
   db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ext_cat_artist_nocase 
+    ON external_catalog(artist COLLATE NOCASE)
+  `).run();
+
+  db.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ext_cat_title_nocase 
+    ON external_catalog(title COLLATE NOCASE)
+  `).run();
+
+  db.prepare(`
     CREATE INDEX IF NOT EXISTS idx_ext_cat_available 
     ON external_catalog(is_available)
   `).run();

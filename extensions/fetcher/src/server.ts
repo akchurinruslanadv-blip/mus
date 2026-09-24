@@ -14,15 +14,17 @@ import {
   getDiscoveryRatio,
   setDiscoveryRatio,
   getRadioSettings,
-  setRadioSettings
+  setRadioSettings,
+  upsertTrack
 } from "./db.ts";
-import { fetchAudioStream, updateYtDlp } from "./fetcher.ts";
+import { fetchAudioStream, updateYtDlp, searchOnlineTracks } from "./fetcher.ts";
 import { getCacheStats, enforceLruCache, cleanCacheNow } from "./lru.ts";
 import { startQueueWatcher } from "./queue_watcher.ts";
 import { resolveTrackAudio, pinTrackForever, unpinTrackFromStorage } from "./stream_proxy.ts";
-import { find12DCandidates, getColdStartSeeds, findPredictiveCatalogTracks } from "./dataset_bridge.ts";
+import { find12DCandidates, getColdStartSeeds, findPredictiveCatalogTracks, searchExternalCatalog } from "./dataset_bridge.ts";
 import { ingestionWorker } from "./ingestion_worker.ts";
 import { radioPoolManager } from "./radio_pool.ts";
+import { AcousticFeatures12D } from "./types.ts";
 
 // Start background workers
 startQueueWatcher();
@@ -45,16 +47,46 @@ console.log(`=======================================================`);
 // Session recent tracks tracking to avoid repetitive recommendations
 const sessionRecentMap = new Map<string, number[]>();
 
-// Builder for dynamic balanced queue honoring user's discoveryRatio (P1: Session-aware & SQLite-backed)
+// Builder for dynamic balanced queue honoring user's discoveryRatio and 12D mood biases
 function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecentIds: number[] = [], sessionId = "default"): any[] {
   const db = getDb();
-  const ratio = getDiscoveryRatio(sessionId, db);
+  const settings = getRadioSettings(sessionId, db);
+  const ratio = settings.discoveryRatio;
+  const biases = settings.biases;
   const targetDiscovery = Math.round(count * ratio);
   const targetFavorites = count - targetDiscovery;
 
   const queue: any[] = [];
   const selectedIds = new Set<number>([currentTrackId, ...excludeRecentIds]);
 
+  // Seed features from current track if available
+  let seedFeatures: AcousticFeatures12D = {
+    danceability: 0.6,
+    energy: 0.6,
+    key: 0,
+    loudness: -8,
+    mode: 1,
+    speechiness: 0.05,
+    acousticness: 0.2,
+    instrumentalness: 0,
+    liveness: 0.1,
+    valence: 0.5,
+    tempo: 120
+  };
+  if (currentTrackId) {
+    try {
+      const curRow = db.prepare(`
+        SELECT ec.features_json 
+        FROM tracks t
+        LEFT JOIN external_catalog ec ON ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE
+        WHERE t.id = ?
+        LIMIT 1
+      `).get(currentTrackId) as { features_json?: string } | undefined;
+      if (curRow?.features_json) {
+        seedFeatures = JSON.parse(curRow.features_json);
+      }
+    } catch {}
+  }
 
   // 1. Gather Favorite candidates
   let favCandidates: any[] = [];
@@ -67,40 +99,114 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
     }
   }
 
-  // 2. Gather Discovery candidates (from ready radioPoolManager or fresh catalog)
+  // 2. Gather Discovery candidates directly driven by active acoustic biases
   let discCandidates: any[] = [];
   if (targetDiscovery > 0) {
-    const readyPool = radioPoolManager.getPool().filter(c => 
-      c.isReady && 
-      c.trackId && 
-      !selectedIds.has(c.trackId) &&
-      !isFavorite(c.trackId, db)
+    const hasBiases = biases && (
+      (biases.energy && Math.abs(biases.energy) > 0.04) ||
+      (biases.valence && Math.abs(biases.valence) > 0.04) ||
+      (biases.acousticness && Math.abs(biases.acousticness) > 0.04) ||
+      (biases.tempo && Math.abs(biases.tempo) > 0.04)
     );
-    for (const pc of readyPool) {
-      if (discCandidates.length >= targetDiscovery) break;
-      discCandidates.push({
-        track_id: pc.trackId,
-        artist: pc.artist,
-        title: pc.title,
-        album: "Radio Discovery",
-        path: pc.filePath || "",
-        duration: 180,
-        score: pc.score || 0.85,
-        explanation: "512D acoustic discovery",
-        explore: true,
-        new_boost: true,
-        cluster_id: -1
-      });
-      selectedIds.add(pc.trackId!);
+
+    const excludeTitles = new Set<string>();
+    try {
+      const rows = db.prepare(`SELECT artist, title FROM tracks WHERE id IN (${Array.from(selectedIds).join(",") || "0"})`).all() as { artist: string; title: string }[];
+      for (const r of rows) excludeTitles.add(`${r.artist} - ${r.title}`.toLowerCase());
+    } catch {}
+
+    // When biases are actively set by user, direct 12D candidate generation takes top priority!
+    if (hasBiases) {
+      const hits = find12DCandidates(seedFeatures, targetDiscovery * 2, excludeTitles, db, biases);
+      for (const hit of hits) {
+        if (discCandidates.length >= targetDiscovery) break;
+        const safeName = `${hit.artist} - ${hit.title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
+        const targetPath = path.join(config.dynamicDir, `${safeName}.webm`);
+        const trackId = upsertTrack({
+          path: targetPath,
+          title: hit.title,
+          artist: hit.artist,
+          album: hit.album || "Radio Discovery",
+          duration: 180
+        }, db);
+
+        discCandidates.push({
+          track_id: trackId,
+          artist: hit.artist,
+          title: hit.title,
+          album: hit.album || "Radio Discovery",
+          path: targetPath,
+          duration: 180,
+          score: hit.similarity,
+          explanation: hit.reason || "12D подбор настроения",
+          explore: true,
+          new_boost: true,
+          cluster_id: -1
+        });
+        selectedIds.add(trackId);
+        excludeTitles.add(`${hit.artist} - ${hit.title}`.toLowerCase());
+      }
     }
 
-    // If pool didn't have enough ready discovery tracks, supplement with strictly non-favorite library tracks
+    // A. Check ready items from radio pool if more candidates needed
+    if (discCandidates.length < targetDiscovery) {
+      const readyPool = radioPoolManager.getPool().filter(c => 
+        c.isReady && 
+        c.trackId && 
+        !selectedIds.has(c.trackId) &&
+        !isFavorite(c.trackId, db)
+      );
+      for (const pc of readyPool) {
+        if (discCandidates.length >= targetDiscovery) break;
+        discCandidates.push({
+          track_id: pc.trackId,
+          artist: pc.artist,
+          title: pc.title,
+          album: "Radio Discovery",
+          path: pc.filePath || "",
+          duration: 180,
+          score: pc.score || 0.85,
+          explanation: "512D акустическое открытие",
+          explore: true,
+          new_boost: true,
+          cluster_id: -1
+        });
+        selectedIds.add(pc.trackId!);
+      }
+    }
+
+    // B. Direct 12D Catalog candidate generation if still below target
     if (discCandidates.length < targetDiscovery) {
       const needed = targetDiscovery - discCandidates.length;
-      const extraDisc = get512DCandidates(Array.from(selectedIds), needed, db, true);
-      discCandidates.push(...extraDisc);
-    }
+      const hits = find12DCandidates(seedFeatures, needed * 2, excludeTitles, db, biases);
+      for (const hit of hits) {
+        if (discCandidates.length >= targetDiscovery) break;
+        const safeName = `${hit.artist} - ${hit.title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
+        const targetPath = path.join(config.dynamicDir, `${safeName}.webm`);
+        const trackId = upsertTrack({
+          path: targetPath,
+          title: hit.title,
+          artist: hit.artist,
+          album: hit.album || "Radio Discovery",
+          duration: 180
+        }, db);
 
+        discCandidates.push({
+          track_id: trackId,
+          artist: hit.artist,
+          title: hit.title,
+          album: hit.album || "Radio Discovery",
+          path: targetPath,
+          duration: 180,
+          score: hit.similarity,
+          explanation: hit.reason || "12D подбор настроения",
+          explore: true,
+          new_boost: true,
+          cluster_id: -1
+        });
+        selectedIds.add(trackId);
+      }
+    }
   }
 
   // 3. Interleave or combine according to ratio
@@ -108,15 +214,12 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
   let discIdx = 0;
   while (queue.length < count && (favIdx < favCandidates.length || discIdx < discCandidates.length)) {
     if (ratio >= 0.7) {
-      // Discovery heavy: take disc first
       if (discIdx < discCandidates.length) queue.push(discCandidates[discIdx++]);
       else if (favIdx < favCandidates.length) queue.push(favCandidates[favIdx++]);
     } else if (ratio <= 0.3) {
-      // Favorite heavy: take fav first
       if (favIdx < favCandidates.length) queue.push(favCandidates[favIdx++]);
       else if (discIdx < discCandidates.length) queue.push(discCandidates[discIdx++]);
     } else {
-      // Balanced: alternate
       if (discIdx < discCandidates.length && (queue.length % 2 === 1 || favIdx >= favCandidates.length)) {
         queue.push(discCandidates[discIdx++]);
       } else if (favIdx < favCandidates.length) {
@@ -391,11 +494,12 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         }, db);
       }
 
-      let updatedQueue: any[] = [];
-      if (activeSession && activeSession.currentId) {
-        updatedQueue = buildBalancedRadioQueue(activeSession.currentId, 6, [], sessionId);
-        updateSessionQueue(activeSession.id, activeSession.currentId, updatedQueue);
+      const curTrackId = activeSession?.currentId || (db.prepare(`SELECT track_id FROM listening_history ORDER BY ts DESC LIMIT 1`).get() as any)?.track_id || 1;
+      const updatedQueue = buildBalancedRadioQueue(curTrackId, 6, [], sessionId);
+      if (activeSession) {
+        updateSessionQueue(activeSession.id, curTrackId, updatedQueue);
       }
+      radioPoolManager.refreshPool(saved.biases).catch(() => {});
 
       return new Response(JSON.stringify({ 
         success: true, 
@@ -499,6 +603,155 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       total512,
       totalCatalog
     }), { headers });
+  }
+
+  // 7d. Instant Catalog Search (across 3.27M tracks)
+  if (url.pathname === "/api/v1/catalog/search" && req.method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const limit = Math.min(100, Math.max(1, parseInt(url.searchParams.get("limit") || "40", 10)));
+    const offset = Math.max(0, parseInt(url.searchParams.get("offset") || "0", 10));
+    const results = searchExternalCatalog(q, limit, offset);
+    return new Response(JSON.stringify(results), { headers });
+  }
+
+  // 7d2. Online Search Fallback (Google & YouTube Music via yt-dlp)
+  if (url.pathname === "/api/v1/catalog/search-online" && req.method === "GET") {
+    const q = (url.searchParams.get("q") || "").trim();
+    const limit = Math.min(20, Math.max(1, parseInt(url.searchParams.get("limit") || "8", 10)));
+    if (!q) {
+      return new Response(JSON.stringify({ count: 0, tracks: [], source: "google_youtube_music" }), { headers });
+    }
+    const onlineTracks = await searchOnlineTracks(q, limit);
+    return new Response(JSON.stringify({ count: onlineTracks.length, tracks: onlineTracks, source: "google_youtube_music" }), { headers });
+  }
+
+  // 7e. Play Track from Catalog (on-demand resolve or playback)
+  if (url.pathname === "/api/v1/catalog/play" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const artist = (body.artist || "").trim();
+      const title = (body.title || "").trim();
+      const album = (body.album || "Catalog Stream").trim();
+      const durationSec = Math.round(body.duration_sec || body.duration || 180);
+
+      if (!artist || !title) {
+        return new Response(JSON.stringify({ error: "Missing artist or title" }), { status: 400, headers });
+      }
+
+      const db = getDb();
+      let trackId: number;
+
+      // 1. Check if track already exists in tracks table
+      const existing = db.prepare(`
+        SELECT id, path FROM tracks 
+        WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+        LIMIT 1
+      `).get(artist, title) as { id: number; path: string } | undefined;
+
+      if (existing) {
+        trackId = existing.id;
+      } else {
+        const safeName = `${artist} - ${title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
+        const targetPath = path.join(config.dynamicDir, `${safeName}.webm`);
+        trackId = upsertTrack({
+          path: targetPath,
+          title,
+          artist,
+          album,
+          duration: durationSec
+        }, db);
+
+        // Copy 12D acoustic features from external_catalog if available
+        try {
+          const cat = db.prepare(`
+            SELECT features_json FROM external_catalog 
+            WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+            LIMIT 1
+          `).get(artist, title) as { features_json?: string } | undefined;
+
+          if (cat?.features_json) {
+            db.prepare(`
+              INSERT INTO features (track_id, embedding_dim, vector, created_at)
+              VALUES (?, 12, ?, ?)
+              ON CONFLICT(track_id, embedding_dim) DO NOTHING
+            `).run(trackId, cat.features_json, new Date().toISOString());
+          }
+        } catch {}
+
+        try {
+          await fetch(`${config.playerUrl}/api/reload`, { method: "POST" });
+        } catch {}
+      }
+
+      return new Response(JSON.stringify({
+        success: true,
+        track_id: trackId,
+        artist,
+        title,
+        streamUrl: `/api/stream/${trackId}`
+      }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers });
+    }
+  }
+
+  // 7f. Add Catalog Track to Queue
+  if (url.pathname === "/api/v1/catalog/queue" && req.method === "POST") {
+    try {
+      const body = await req.json();
+      const artist = (body.artist || "").trim();
+      const title = (body.title || "").trim();
+      const album = (body.album || "Catalog Stream").trim();
+      const durationSec = Math.round(body.duration_sec || body.duration || 180);
+
+      if (!artist || !title) {
+        return new Response(JSON.stringify({ error: "Missing artist or title" }), { status: 400, headers });
+      }
+
+      const db = getDb();
+      let trackId: number;
+      const existing = db.prepare(`
+        SELECT id, path FROM tracks 
+        WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+        LIMIT 1
+      `).get(artist, title) as { id: number; path: string } | undefined;
+
+      if (existing) {
+        trackId = existing.id;
+      } else {
+        const safeName = `${artist} - ${title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
+        const targetPath = path.join(config.dynamicDir, `${safeName}.webm`);
+        trackId = upsertTrack({
+          path: targetPath,
+          title,
+          artist,
+          album,
+          duration: durationSec
+        }, db);
+      }
+
+      // Add to session queue
+      const activeSession = getActiveSession(db);
+      const sessionId = body.sessionId || (activeSession ? activeSession.id : "default");
+      const currentQueue = activeSession ? activeSession.queue : [];
+      currentQueue.push({
+        track_id: trackId,
+        artist,
+        title,
+        album,
+        duration: durationSec
+      } as any);
+
+      updateSessionQueue(sessionId, activeSession?.currentId || trackId, currentQueue, db);
+
+      return new Response(JSON.stringify({
+        success: true,
+        track_id: trackId,
+        queue: currentQueue
+      }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers });
+    }
   }
 
   // 8. Ingestion Queue API (Import Playlist by titles)
@@ -808,54 +1061,13 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         const nextIsFav = data.next_id ? isFavorite(data.next_id, db) : false;
         const ratioMismatch = (ratio >= 0.7 && nextIsFav) || (ratio <= 0.3 && !nextIsFav);
 
-        const shouldSubstitute = (data.mode === "radio" || !data.fixed) && (isDirectStall || isRecentRepeat || isUpstreamFallback || ratioMismatch);
+        const isRadio = (data.mode === "radio" || !data.fixed);
 
-        if (shouldSubstitute || (data.ended && data.mode === "radio")) {
-          console.log(`[radio-engine] Selecting next track (next=${data.next_id}, played=${playedTrackId}, ratio=${ratio})...`);
-          let nextCandidate: any = null;
-
-          // 1. Try taking from current queue if valid
-          if (Array.isArray(data.queue) && data.queue.length > 0) {
-            const validIdx = data.queue.findIndex((q: any) => q.track_id && q.track_id !== playedTrackId && !recentWindow.includes(q.track_id));
-            if (validIdx !== -1) {
-              nextCandidate = data.queue.splice(validIdx, 1)[0];
-            }
-          }
-
-          // 2. Fallback based on ratio
-          if (!nextCandidate) {
-            if (ratio <= 0.3) {
-              const favs = getFavoriteCandidates([playedTrackId, ...recents], 1, db);
-              if (favs.length > 0) nextCandidate = favs[0];
-            } else if (ratio >= 0.7) {
-              const poolReady = radioPoolManager.getPool().find(c => 
-                c.isReady && 
-                c.trackId && 
-                c.trackId !== playedTrackId && 
-                !recentWindow.includes(c.trackId) &&
-                !isFavorite(c.trackId, db)
-              );
-              if (poolReady && poolReady.trackId) {
-                nextCandidate = {
-                  track_id: poolReady.trackId,
-                  artist: poolReady.artist,
-                  title: poolReady.title,
-                  album: "Radio Discovery",
-                  duration: 180
-                };
-              }
-            }
-          }
-
-          // 3. Fallback to 512D library candidates (strictly non-favorites if ratio >= 0.7)
-          if (!nextCandidate) {
-            const smallExclude = Array.from(new Set([playedTrackId, ...recents.slice(-6)].filter(Boolean)));
-            const candidates = get512DCandidates(smallExclude, 1, db, ratio >= 0.7);
-            if (candidates.length > 0) nextCandidate = candidates[0];
-          }
-
-
-          if (nextCandidate) {
+        if (isRadio) {
+          console.log(`[radio-engine] Radio mode: dynamically steering next track according to discovery ratio and 12D biases...`);
+          const balancedQueue = buildBalancedRadioQueue(playedTrackId, 6, recents.slice(-6), sessId);
+          if (balancedQueue.length > 0) {
+            const nextCandidate = balancedQueue[0];
             data.next_id = nextCandidate.track_id;
             data.next = {
               id: nextCandidate.track_id,
@@ -866,6 +1078,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
               ready: true,
               stream: `/api/stream/${nextCandidate.track_id}`
             };
+            data.queue = balancedQueue.slice(1);
             data.ended = false;
           }
         }
@@ -878,9 +1091,11 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         }
         sessionRecentMap.set(sessId, recents);
 
-        // Build upcoming queue strictly balanced by discoveryRatio
         const nextId = data.next_id || data.current?.id || 0;
-        data.queue = buildBalancedRadioQueue(nextId, 6, recents.slice(-6), sessId);
+        if (!isRadio) {
+          // Build upcoming queue strictly balanced by discoveryRatio
+          data.queue = buildBalancedRadioQueue(nextId, 6, recents.slice(-6), sessId);
+        }
 
         // Sync play session in SQLite
 
