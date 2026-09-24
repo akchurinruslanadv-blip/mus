@@ -21,7 +21,13 @@ import { fetchAudioStream, updateYtDlp, searchOnlineTracks } from "./fetcher.ts"
 import { getCacheStats, enforceLruCache, cleanCacheNow } from "./lru.ts";
 import { startQueueWatcher } from "./queue_watcher.ts";
 import { resolveTrackAudio, pinTrackForever, unpinTrackFromStorage } from "./stream_proxy.ts";
-import { find12DCandidates, getColdStartSeeds, findPredictiveCatalogTracks, searchExternalCatalog } from "./dataset_bridge.ts";
+import { 
+  find12DCandidates, 
+  getColdStartSeeds, 
+  findPredictiveCatalogTracks, 
+  searchExternalCatalog,
+  syncAllLocalTracksTo12DCatalog 
+} from "./dataset_bridge.ts";
 import { ingestionWorker } from "./ingestion_worker.ts";
 import { radioPoolManager } from "./radio_pool.ts";
 import { AcousticFeatures12D } from "./types.ts";
@@ -30,6 +36,15 @@ import { AcousticFeatures12D } from "./types.ts";
 startQueueWatcher();
 ingestionWorker.start();
 radioPoolManager.start();
+
+// Automatically project all local 512D tracks into 12D catalog in background
+setTimeout(() => {
+  try {
+    syncAllLocalTracksTo12DCatalog();
+  } catch (err) {
+    console.error("[12D-bridge] Startup sync error:", err);
+  }
+}, 1000);
 
 // P2: Automatic yt-dlp update check on startup if enabled
 if (config.autoUpdateYtdlp) {
@@ -603,6 +618,16 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       total512,
       totalCatalog
     }), { headers });
+  }
+
+  // 7c2. Sync & Project Local 512D Tracks to 12D Catalog
+  if (url.pathname === "/api/v1/catalog/sync-12d" && req.method === "POST") {
+    try {
+      const count = syncAllLocalTracksTo12DCatalog();
+      return new Response(JSON.stringify({ success: true, projectedCount: count }), { headers });
+    } catch (e) {
+      return new Response(JSON.stringify({ success: false, error: String(e) }), { status: 500, headers });
+    }
   }
 
   // 7d. Instant Catalog Search (across 3.27M tracks)

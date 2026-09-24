@@ -271,6 +271,159 @@ export function insertExternal12DTracksBatch(
   return count;
 }
 
+// --- 512D Neural to 12D Acoustic Vector Projection Engine ---
+
+type Anchor = {
+  vec: Float32Array;
+  features: AcousticFeatures12D;
+};
+
+let cachedAnchors: Anchor[] | null = null;
+let lastAnchorsLoadTime = 0;
+
+export function loadAcousticAnchors(db = getDb(), forceReload = false): Anchor[] {
+  const now = Date.now();
+  if (cachedAnchors && !forceReload && (now - lastAnchorsLoadTime < 300000)) {
+    return cachedAnchors;
+  }
+
+  const rows = db.prepare(`
+    SELECT f.embedding, ec.features_json 
+    FROM tracks t 
+    JOIN features f ON f.track_id = t.id 
+    JOIN external_catalog ec ON ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE 
+    WHERE f.embedding IS NOT NULL AND length(f.embedding) = 2048
+    LIMIT 600
+  `).all() as { embedding: Uint8Array; features_json: string }[];
+
+  const anchors: Anchor[] = [];
+  for (const r of rows) {
+    try {
+      const f = JSON.parse(r.features_json);
+      const u8 = new Uint8Array(r.embedding);
+      const f32 = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+      anchors.push({ vec: f32, features: f });
+    } catch {}
+  }
+
+  cachedAnchors = anchors;
+  lastAnchorsLoadTime = now;
+  return anchors;
+}
+
+function dot512(a: Float32Array, b: Float32Array): number {
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+// Convert 512D CLAP embedding into full 12D acoustic properties via acoustic anchor projection
+export function project512Dto12D(vec: Float32Array, db = getDb(), k = 7): AcousticFeatures12D {
+  const anchors = loadAcousticAnchors(db);
+  if (anchors.length === 0) {
+    return {
+      danceability: 0.6,
+      energy: 0.6,
+      valence: 0.5,
+      acousticness: 0.2,
+      tempo: 120,
+      speechiness: 0.05,
+      loudness: -8,
+      instrumentalness: 0.05,
+      liveness: 0.1,
+      key: 0,
+      mode: 1
+    };
+  }
+
+  const scored = anchors.map(a => ({ anchor: a, sim: dot512(vec, a.vec) }));
+  scored.sort((x, y) => y.sim - x.sim);
+
+  const topK = scored.slice(0, Math.min(k, scored.length));
+  let totalW = 0;
+  let dance = 0, energy = 0, valence = 0, acoustic = 0, tempo = 0, speech = 0, loud = 0, inst = 0, live = 0;
+
+  for (const item of topK) {
+    const w = Math.max(0.001, Math.exp(item.sim * 5));
+    totalW += w;
+    const f = item.anchor.features;
+    dance += (f.danceability || 0.5) * w;
+    energy += (f.energy || 0.5) * w;
+    valence += (f.valence || 0.5) * w;
+    acoustic += (f.acousticness || 0.2) * w;
+    tempo += (f.tempo || 120) * w;
+    speech += (f.speechiness || 0.05) * w;
+    loud += (f.loudness || -8) * w;
+    inst += (f.instrumentalness || 0) * w;
+    live += (f.liveness || 0.1) * w;
+  }
+
+  return {
+    danceability: Math.round((dance / totalW) * 1000) / 1000,
+    energy: Math.round((energy / totalW) * 1000) / 1000,
+    valence: Math.round((valence / totalW) * 1000) / 1000,
+    acousticness: Math.round((acoustic / totalW) * 1000) / 1000,
+    tempo: Math.round((tempo / totalW) * 10) / 10,
+    speechiness: Math.round((speech / totalW) * 1000) / 1000,
+    loudness: Math.round((loud / totalW) * 10) / 10,
+    instrumentalness: Math.round((inst / totalW) * 1000) / 1000,
+    liveness: Math.round((live / totalW) * 1000) / 1000,
+    key: topK[0]?.anchor.features.key || 0,
+    mode: topK[0]?.anchor.features.mode || 1
+  };
+}
+
+// Ensure ALL local tracks with 512D embeddings are registered into 12D external_catalog
+export function syncAllLocalTracksTo12DCatalog(db = getDb()): number {
+  const missing = db.prepare(`
+    SELECT t.id, t.artist, t.title, t.album, t.duration, f.embedding, f.bpm, f.lufs
+    FROM tracks t
+    JOIN features f ON f.track_id = t.id
+    WHERE f.embedding IS NOT NULL AND length(f.embedding) = 2048
+      AND NOT EXISTS (
+        SELECT 1 FROM external_catalog ec 
+        WHERE ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE
+      )
+  `).all() as any[];
+
+  if (missing.length === 0) return 0;
+
+  console.log(`[12D-bridge] Projecting ${missing.length} unmapped local 512D tracks into 12D catalog...`);
+  let count = 0;
+  const now = new Date().toISOString();
+
+  db.transaction(() => {
+    const insertStmt = db.prepare(`
+      INSERT INTO external_catalog (artist, title, album, duration_sec, genre, features_json, is_available, added_at)
+      VALUES (?, ?, ?, ?, 'Local Library', ?, 1, ?)
+      ON CONFLICT(artist, title) DO UPDATE SET features_json = excluded.features_json
+    `);
+
+    for (const t of missing) {
+      try {
+        const u8 = new Uint8Array(t.embedding);
+        const f32 = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+        const projected = project512Dto12D(f32, db);
+        if (t.bpm && t.bpm > 40) projected.tempo = Math.round(t.bpm * 10) / 10;
+        if (t.lufs) projected.loudness = Math.round(t.lufs * 10) / 10;
+
+        insertStmt.run(
+          t.artist,
+          t.title,
+          t.album || "Local Library",
+          t.duration || 180,
+          JSON.stringify(projected),
+          now
+        );
+        count++;
+      } catch {}
+    }
+  })();
+
+  console.log(`[12D-bridge] Successfully projected and indexed ${count} tracks into 12D catalog!`);
+  return count;
+}
+
 // Predict top catalog tracks matching user taste that can be pre-indexed into 512D
 export function findPredictiveCatalogTracks(
   count = 15,
@@ -283,19 +436,19 @@ export function findPredictiveCatalogTracks(
     SELECT c.features_json
     FROM favorites f
     JOIN tracks t ON f.track_id = t.id
-    JOIN external_catalog c ON LOWER(c.artist) = LOWER(t.artist) AND LOWER(c.title) = LOWER(t.title)
+    JOIN external_catalog c ON c.artist = t.artist COLLATE NOCASE AND c.title = t.title COLLATE NOCASE
     WHERE c.features_json IS NOT NULL
-    LIMIT 50
+    LIMIT 60
   `).all() as FeatRow[];
 
   if (rows.length === 0) {
     rows = db.prepare(`
       SELECT c.features_json
       FROM tracks t
-      JOIN external_catalog c ON LOWER(c.artist) = LOWER(t.artist) AND LOWER(c.title) = LOWER(t.title)
+      JOIN external_catalog c ON c.artist = t.artist COLLATE NOCASE AND c.title = t.title COLLATE NOCASE
       WHERE c.features_json IS NOT NULL
       ORDER BY t.play_count DESC, t.id DESC
-      LIMIT 50
+      LIMIT 60
     `).all() as FeatRow[];
   }
 
