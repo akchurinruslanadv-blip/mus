@@ -242,8 +242,9 @@
         <h2 style="margin:0; font-size:1.3rem;">⚡ Умный кэш 3 ГБ и 512D База Знаний</h2>
         <div style="display:flex; gap:8px; align-items:center;">
           <span id="addon-512-badge" style="background:rgba(56, 189, 248, 0.2); color:#38bdf8; border:1px solid rgba(56, 189, 248, 0.4); padding:4px 10px; border-radius:12px; font-size:0.85rem; font-weight:700;">🧠 512D Векторов: Загрузка…</span>
-          <span id="addon-catalog-badge" style="background:#22c55e22; color:#22c55e; padding:4px 10px; border-radius:12px; font-size:0.85rem; font-weight:600;">81k Каталог</span>
+          <span id="addon-catalog-badge" style="background:#22c55e22; color:#22c55e; padding:4px 10px; border-radius:12px; font-size:0.85rem; font-weight:600;">⚡ Каталог Открытий</span>
         </div>
+
       </div>
 
       <!-- Cache Meter -->
@@ -581,13 +582,12 @@
         <span style="opacity:0.4;">|</span>
         <span style="color:#38bdf8; font-weight:700;">🧠 512D Векторов:</span>
         <span id="addon-home-512" style="color:#38bdf8; font-weight:700; background:rgba(56,189,248,0.18); border:1px solid rgba(56,189,248,0.35); padding:2px 8px; border-radius:8px;">Загрузка…</span>
-        <span style="opacity:0.4;">|</span>
-        <span style="color:#22c55e; font-weight:600;">81k Каталог</span>
       </div>
       <button type="button" class="btn quiet sm" id="btn-home-goto-upload" style="padding:4px 12px; font-size:0.82rem; border-color:rgba(224,122,58,0.5); cursor:pointer;">
         📥 Импорт плейлиста (512D) →
       </button>
     `;
+
 
     homeIntro.appendChild(banner);
 
@@ -766,8 +766,9 @@
         badges.push(`<span class="addon-src-badge" title="Оцифрован нейросетью CLAP (512 параметров)" style="background:rgba(56,189,248,0.18); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); padding:2px 7px; border-radius:8px; font-size:0.75rem; font-weight:700;">🧠 512D Вектор</span>`);
       }
       if (t.in_12d) {
-        badges.push(`<span class="addon-src-badge" title="Подобран из каталога 81k треков по 12 свойствам" style="background:rgba(234,179,8,0.18); color:#eab308; border:1px solid rgba(234,179,8,0.4); padding:2px 7px; border-radius:8px; font-size:0.75rem; font-weight:700;">⚡ 12D Каталог</span>`);
+        badges.push(`<span class="addon-src-badge" title="Подобран из каталога треков по 12 акустическим свойствам" style="background:rgba(234,179,8,0.18); color:#eab308; border:1px solid rgba(234,179,8,0.4); padding:2px 7px; border-radius:8px; font-size:0.75rem; font-weight:700;">⚡ 12D Каталог</span>`);
       }
+
       if (t.playlist_name) {
         badges.push(`<span class="addon-src-badge" title="Из плейлиста: ${t.playlist_name}" style="background:rgba(168,85,247,0.18); color:#c084fc; border:1px solid rgba(168,85,247,0.4); padding:2px 7px; border-radius:8px; font-size:0.75rem; font-weight:700;">📁 ${t.playlist_name}</span>`);
       }
@@ -999,8 +1000,9 @@
       badges.push(`<span class="addon-src-badge" title="Оцифрован нейросетью CLAP (512 параметров)" style="background:rgba(56,189,248,0.15); color:#38bdf8; border:1px solid rgba(56,189,248,0.3); padding:1px 5px; border-radius:6px; font-size:0.68rem; font-weight:700;">🧠 512D</span>`);
     }
     if (t.in_12d) {
-      badges.push(`<span class="addon-src-badge" title="Подобран из каталога 81k треков по 12 акустическим свойствам" style="background:rgba(234,179,8,0.15); color:#eab308; border:1px solid rgba(234,179,8,0.3); padding:1px 5px; border-radius:6px; font-size:0.68rem; font-weight:600;">⚡ 12D</span>`);
+      badges.push(`<span class="addon-src-badge" title="Подобран из каталога треков по 12 акустическим свойствам" style="background:rgba(234,179,8,0.15); color:#eab308; border:1px solid rgba(234,179,8,0.3); padding:1px 5px; border-radius:6px; font-size:0.68rem; font-weight:600;">⚡ 12D</span>`);
     }
+
     if (t.playlist_name) {
       badges.push(`<span class="addon-src-badge" title="Из плейлиста: ${t.playlist_name}" style="background:rgba(168,85,247,0.15); color:#c084fc; border:1px solid rgba(168,85,247,0.3); padding:1px 5px; border-radius:6px; font-size:0.68rem; font-weight:600;">📁 ${t.playlist_name}</span>`);
     }
