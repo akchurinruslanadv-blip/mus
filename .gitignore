@@ -1,0 +1,64 @@
+# ==========================================
+# musik - .gitignore
+# ==========================================
+
+# 1. Local Audio Files & Dynamic Cache (Never commit 3GB cache!)
+dynamic/
+data/cache/
+data/audio/
+data/music/
+data/*.csv
+*.mp3
+*.flac
+*.m4a
+*.wav
+*.ogg
+*.opus
+
+# 2. SQLite Database Files & WAL Journal (Keep schema.sql, ignore live data)
+data/db/*.db
+data/db/*.db-wal
+data/db/*.db-shm
+*.db
+*.sqlite
+*.sqlite3
+
+# 3. Local Binaries & Compiled Executables
+bin/
+*.exe
+*.dll
+
+# 4. Python Environment, Cache & Embedder Artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pt
+*.bin
+*.onnx
+
+# 5. Deno & Node Dependencies
+.deno/
+node_modules/
+
+# 6. Operating System & Editor Metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 7. Logs & Temporary Scratch Files
+*.log
+*.tmp
+logs/
+*.html
+vk_music*.txt
+playlists/*.txt

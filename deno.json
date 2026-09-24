@@ -1,0 +1,15 @@
+{
+  "tasks": {
+    "start": "deno task --cwd extensions/fetcher start",
+    "test": "deno task --cwd extensions/fetcher test",
+    "import": "deno task --cwd extensions/fetcher import"
+  },
+  "imports": {
+    "@std/path": "jsr:@std/path@1",
+    "@std/fs": "jsr:@std/fs@1",
+    "@std/cli": "jsr:@std/cli@1",
+    "@std/http": "jsr:@std/http@1",
+    "@std/assert": "jsr:@std/assert@1",
+    "@db/sqlite": "jsr:@db/sqlite@0.12"
+  }
+}

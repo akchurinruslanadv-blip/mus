@@ -1,0 +1,19 @@
+services:
+  player:
+    build:
+      context: .
+      dockerfile: Dockerfile.player.dev
+    working_dir: /workspace/player
+    command: ["go", "run", "./cmd/musik-player"]
+    volumes:
+      - ./player:/workspace/player
+      - musik-go-build:/root/.cache/go-build
+      - musik-go-mod:/go/pkg/mod
+
+  worker:
+    volumes:
+      - ./src:/app/src:ro
+
+volumes:
+  musik-go-build:
+  musik-go-mod:

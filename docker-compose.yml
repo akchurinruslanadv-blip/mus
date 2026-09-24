@@ -1,0 +1,66 @@
+# docker-compose.yml: Complete streaming stack (Go Core + Python Worker + Deno Gateway)
+version: '3.8'
+
+services:
+  # 1. Front-Facing Gateway: Deno Sidecar (Streaming, Reverse Proxy & 12D Catalog Bridge)
+  gateway:
+    build:
+      context: ./extensions/fetcher
+      dockerfile: Dockerfile
+    container_name: musik-gateway
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - FETCHER_PORT=8787
+      - MUSIK_PLAYER_URL=http://player:8786
+      - CACHE_MAX_GB=3.0
+      - AUTO_UPDATE_YTDLP=1
+      - MAX_CPU_THREADS=2
+      - MIN_TRACK_DURATION_SEC=40
+      - MAX_TRACK_DURATION_SEC=720
+      - MAX_SPEECHINESS=0.35
+    volumes:
+      - ./data:/app/data
+      - ./dynamic:/app/dynamic
+    depends_on:
+      - player
+
+  # 2. Go Audio Player (Internal Core)
+  player:
+    build:
+      context: ./musik-main
+      dockerfile: Dockerfile.player
+    container_name: musik-player
+    restart: unless-stopped
+    environment:
+      - MUSIK_DB_PATH=/data/db/musik.db
+      - MUSIK_LIBRARY=/data/music
+      - MUSIK_WORKER_URL=http://worker:8790
+      - MUSIK_WORKER_AUTOSTART=0
+      - MUSIK_PLAYER_ADDR=:8786
+      - MUSIK_AUTH_DISABLED=1
+    volumes:
+      - ./data:/data
+      - ./dynamic:/dynamic:ro
+    depends_on:
+      - worker
+
+  # 3. Python CLAP 512D Embedder Worker
+  worker:
+    build:
+      context: ./musik-main
+      dockerfile: Dockerfile.worker
+    container_name: musik-worker
+    restart: unless-stopped
+    environment:
+      - MUSIK_DB_PATH=/data/db/musik.db
+      - MUSIK_LIBRARY=/data/music
+      - MUSIK_DATA_DIR=/data
+      - MUSIK_EMBEDDINGS_CACHE=/data/cache/embeddings
+      - MUSIK_ARTWORK_CACHE=/data/cache/artwork
+      - MUSIK_WORKER_ADDR=0.0.0.0:8790
+      - MUSIK_PLAYER_RELOAD_URL=http://player:8786/api/reload
+    volumes:
+      - ./data:/data
+      - ./dynamic:/dynamic:ro

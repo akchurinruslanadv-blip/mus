@@ -1,0 +1,19 @@
+{
+  "name": "@musik/fetcher",
+  "version": "1.0.0",
+  "exports": "./src/server.ts",
+  "description": "Smart On-Demand Streaming, 12D Catalog Bridge & LRU Cache Extension for musik",
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-write --allow-run --allow-env --allow-ffi src/server.ts",
+    "test": "deno test --allow-read --allow-write --allow-net --allow-env --allow-ffi tests/",
+    "import": "deno run --allow-read --allow-write --allow-net --allow-env --allow-ffi scripts/import_dataset.ts"
+  },
+  "imports": {
+    "@std/path": "jsr:@std/path@1",
+    "@std/fs": "jsr:@std/fs@1",
+    "@std/cli": "jsr:@std/cli@1",
+    "@std/http": "jsr:@std/http@1",
+    "@std/assert": "jsr:@std/assert@1",
+    "@db/sqlite": "jsr:@db/sqlite@0.12"
+  }
+}

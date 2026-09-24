@@ -1,0 +1,21 @@
+# syntax=docker/dockerfile:1.7
+# Development player: source is bind-mounted, Go caches survive restarts.
+FROM golang:bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace/player
+ENV GOTOOLCHAIN=auto \
+    MUSIK_PLAYER_ADDR=:8787 \
+    MUSIK_WORKER_AUTOSTART=0 \
+    MUSIK_DB_PATH=/data/db/musik.db \
+    MUSIK_LIBRARY=/music \
+    MUSIK_WORKER_URL=http://worker:8790 \
+    MUSIK_ROOT=/workspace
+
+COPY player/go.mod player/go.sum ./
+RUN go mod download
+
+EXPOSE 8787
+CMD ["go", "run", "./cmd/musik-player"]

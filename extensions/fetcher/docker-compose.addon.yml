@@ -1,0 +1,25 @@
+# extensions/fetcher/docker-compose.addon.yml
+# Include this block or merge into your root docker-compose.yml
+
+version: '3.8'
+
+services:
+  # The Sidecar Fetcher & 12D Catalog Bridge
+  fetcher:
+    build:
+      context: ./extensions/fetcher
+      dockerfile: Dockerfile
+    container_name: musik-fetcher
+    restart: unless-stopped
+    ports:
+      - "8795:8795"
+    environment:
+      - FETCHER_PORT=8795
+      - CACHE_MAX_GB=3.0
+      - MUSIK_PLAYER_URL=http://player:8787
+      - MAX_CPU_THREADS=2
+    volumes:
+      - ./data:/app/data
+      - ./dynamic:/app/dynamic
+    depends_on:
+      - player
