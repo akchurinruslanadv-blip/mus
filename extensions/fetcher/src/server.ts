@@ -254,9 +254,10 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
     }
   }
 
-  // Zero-Stall Guarantee: If the immediate next track (queue[0]) is not ready on disk,
-  // promote an already ready track (from favorites, ready pool, or library) to queue[0]!
-  if (queue.length > 1) {
+  // Zero-Stall Guarantee: Ensure the immediate next 2 tracks (queue[0] and queue[1]) are 100% ready on disk.
+  // This guarantees that single or double-skipping starts playing instantly (0ms latency),
+  // while the background queue watcher pre-fetches queue[2] and queue[3].
+  if (queue.length > 0) {
     const isReadySync = (item: any): boolean => {
       if (!item?.path) return false;
       try {
@@ -266,43 +267,48 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
       }
     };
 
-    if (!isReadySync(queue[0])) {
-      const readyIdx = queue.findIndex(item => isReadySync(item));
-      if (readyIdx > 0) {
-        const [readyTrack] = queue.splice(readyIdx, 1);
-        queue.unshift(readyTrack);
-      } else {
-        const readyPoolCand = radioPoolManager.getReadyPool().find(c => c.trackId && !selectedIds.has(c.trackId));
-        if (readyPoolCand && readyPoolCand.trackId) {
-          queue.unshift({
-            track_id: readyPoolCand.trackId,
-            artist: readyPoolCand.artist,
-            title: readyPoolCand.title,
-            album: "Radio Discovery",
-            path: readyPoolCand.filePath || "",
-            duration: 180,
-            score: readyPoolCand.score || 0.85,
-            explanation: readyPoolCand.explanation || "🧠 Горячий трек из пула",
-            explore: true,
-            new_boost: true,
-            cluster_id: -1
-          });
+    const slotsToCheck = Math.min(2, queue.length);
+    for (let slot = 0; slot < slotsToCheck; slot++) {
+      if (!isReadySync(queue[slot])) {
+        const readyIdx = queue.findIndex((item, idx) => idx > slot && isReadySync(item));
+        if (readyIdx > slot) {
+          const [readyTrack] = queue.splice(readyIdx, 1);
+          queue.splice(slot, 0, readyTrack);
         } else {
-          const hot = getHotStartingTrack(db);
-          if (hot && !selectedIds.has(hot.id)) {
-            queue.unshift({
-              track_id: hot.id,
-              artist: hot.artist,
-              title: hot.title,
-              album: hot.album,
-              path: hot.path,
-              duration: hot.duration,
-              score: 0.9,
-              explanation: "Готовый трек (Zero-Stall)",
-              explore: false,
-              new_boost: false,
+          const readyPoolCand = radioPoolManager.getReadyPool().find(c => c.trackId && !selectedIds.has(c.trackId) && !queue.some(q => q.track_id === c.trackId));
+          if (readyPoolCand && readyPoolCand.trackId) {
+            queue.splice(slot, 0, {
+              track_id: readyPoolCand.trackId,
+              artist: readyPoolCand.artist,
+              title: readyPoolCand.title,
+              album: "Radio Discovery",
+              path: readyPoolCand.filePath || "",
+              duration: 180,
+              score: readyPoolCand.score || 0.85,
+              explanation: readyPoolCand.explanation || "🧠 Горячий трек из пула",
+              explore: true,
+              new_boost: true,
               cluster_id: -1
             });
+            selectedIds.add(readyPoolCand.trackId);
+          } else {
+            const hot = getHotStartingTrack(db);
+            if (hot && !selectedIds.has(hot.id) && !queue.some(q => q.track_id === hot.id)) {
+              queue.splice(slot, 0, {
+                track_id: hot.id,
+                artist: hot.artist,
+                title: hot.title,
+                album: hot.album,
+                path: hot.path,
+                duration: hot.duration,
+                score: 0.9,
+                explanation: "Готовый трек (Zero-Stall)",
+                explore: false,
+                new_boost: false,
+                cluster_id: -1
+              });
+              selectedIds.add(hot.id);
+            }
           }
         }
       }

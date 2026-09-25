@@ -1,0 +1,70 @@
+# Multi-stage Dockerfile optimized for 1 vCPU / 1GB RAM VPS
+# Total image size: ~380MB (vs 4.5GB standard PyTorch image)
+
+# Stage 1: Compile Go player core
+FROM golang:1.24-bookworm AS builder
+WORKDIR /src
+COPY musik-main/player /src
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o /bin/musik-player ./cmd/musik-player
+
+# Stage 2: Minimal runtime image
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    curl \
+    ffmpeg \
+    sqlite3 \
+    python3 \
+    python3-venv \
+    python3-pip \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Deno
+RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh
+
+# Install yt-dlp standalone binary
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
+
+# Install ultra-light ONNX runtime into virtualenv
+RUN python3 -m venv /opt/venv_onnx \
+    && /opt/venv_onnx/bin/pip install --no-cache-dir numpy onnxruntime
+
+WORKDIR /app
+
+# Copy Go player binary
+COPY --from=builder /bin/musik-player /usr/local/bin/musik-player
+RUN chmod +x /usr/local/bin/musik-player
+
+# Copy application source
+COPY extensions ./extensions
+COPY data ./data
+
+# Setup environment
+ENV MUSIK_ROOT=/app \
+    MUSIK_LIBRARY=/app/dynamic \
+    MUSIK_DB_PATH=/app/data/db/musik.db \
+    MUSIK_PLAYER_ADDR=127.0.0.1:8786 \
+    MUSIK_PLAYER_URL=http://127.0.0.1:8786 \
+    MUSIK_AUTH_DISABLED=1 \
+    MUSIK_WORKER_AUTOSTART=0 \
+    FETCHER_PORT=8787 \
+    EMBEDDER_URL=http://127.0.0.1:8790 \
+    CACHE_MAX_GB=1.0 \
+    YTDLP_PATH=/usr/local/bin/yt-dlp \
+    PYTHON_PATH=/opt/venv_onnx/bin/python \
+    FFMPEG_PATH=/usr/bin/ffmpeg
+
+EXPOSE 8787
+
+# Create runtime directories
+RUN mkdir -p /app/dynamic /app/data/music/favorites /app/data/db
+
+# Entrypoint script to launch all 3 micro-daemons
+CMD ["sh", "-c", "\
+  /usr/local/bin/musik-player & \
+  /opt/venv_onnx/bin/python extensions/fetcher/scripts/embedder_onnx.py --server --port 8790 --db /app/data/db/musik.db & \
+  deno run --allow-all extensions/fetcher/src/server.ts \
+"]

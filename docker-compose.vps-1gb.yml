@@ -1,0 +1,23 @@
+services:
+  musik:
+    build:
+      context: .
+      dockerfile: Dockerfile.vps-1gb
+    container_name: musik-player
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - CACHE_MAX_GB=1.0
+      - FETCHER_PORT=8787
+      - MUSIK_AUTH_DISABLED=1
+    volumes:
+      - ./data/db:/app/data/db
+      - ./data/music/favorites:/app/data/music/favorites
+      - ./dynamic:/app/dynamic
+      - ./cookies.txt:/app/cookies.txt:ro
+    deploy:
+      resources:
+        limits:
+          memory: 850M
+          cpus: '1.0'
