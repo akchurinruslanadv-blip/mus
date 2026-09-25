@@ -127,5 +127,7 @@ export interface RadioPoolCandidate {
   has512Embedding: boolean;
   isReady: boolean;
   score: number;
+  // Human-readable label: "🧠 512D Отбор (73% вкус)" stamped after centroid scoring
+  explanation?: string;
   addedAt: string;
 }

@@ -189,32 +189,41 @@
         });
         const data = await res.json();
         if (data && Array.isArray(data.queue) && data.queue.length > 0) {
-          if (typeof window.renderQueue === "function") {
-            window.renderQueue(data.queue);
-          }
           const ol = document.getElementById("queue");
-          if (ol) {
-            ol.innerHTML = "";
-            data.queue.forEach((q) => {
-              const li = document.createElement("li");
-              if (q.track_id) {
-                li.dataset.trackId = String(q.track_id);
-                li.style.cursor = "pointer";
-                li.title = "▶ Нажмите, чтобы включить прямо сейчас";
-                li.onclick = () => playTrackNow(q.track_id);
-              }
-              const tags = [];
-              if (q.explore) tags.push('<span class="tag">far</span>');
-              if (q.new_boost) tags.push('<span class="tag">new</span>');
-              li.innerHTML = `<strong>${escapeHtml(q.artist || "")}</strong> — ${escapeHtml(q.title || "")}${tags.join("")}<span class="why">${escapeHtml(q.explanation || "")}</span>`;
-              ol.appendChild(li);
-            });
-            const qCount = document.getElementById("queue-count");
-            if (qCount) qCount.textContent = String(data.queue.length);
-            const addonQCnt = document.getElementById("addon-queue-cnt");
-            if (addonQCnt) addonQCnt.textContent = String(data.queue.length);
+
+          // DOM diffing: only rebuild if track IDs actually changed to avoid strobe
+          const newIds = data.queue.map(q => String(q.track_id || "")).join(",");
+          const oldIds = ol ? Array.from(ol.querySelectorAll("li")).map(li => li.dataset.trackId || "").join(",") : "";
+          const queueChanged = newIds !== oldIds;
+
+          if (queueChanged) {
+            if (typeof window.renderQueue === "function") {
+              window.renderQueue(data.queue);
+            }
+            if (ol) {
+              ol.innerHTML = "";
+              data.queue.forEach((q) => {
+                const li = document.createElement("li");
+                if (q.track_id) {
+                  li.dataset.trackId = String(q.track_id);
+                  li.style.cursor = "pointer";
+                  li.title = "▶ Нажмите, чтобы включить прямо сейчас";
+                  li.onclick = () => playTrackNow(q.track_id);
+                }
+                const tags = [];
+                if (q.explore) tags.push('<span class="tag">far</span>');
+                if (q.new_boost) tags.push('<span class="tag">new</span>');
+                li.innerHTML = `<strong>${escapeHtml(q.artist || "")}</strong> — ${escapeHtml(q.title || "")}${tags.join("")}<span class="why">${escapeHtml(q.explanation || "")}</span>`;
+                ol.appendChild(li);
+              });
+              const qCount = document.getElementById("queue-count");
+              if (qCount) qCount.textContent = String(data.queue.length);
+              const addonQCnt = document.getElementById("addon-queue-cnt");
+              if (addonQCnt) addonQCnt.textContent = String(data.queue.length);
+              // Kick badge update only after actual DOM rebuild
+              setTimeout(updateQueueOrigins, 60);
+            }
           }
-          setTimeout(updateQueueOrigins, 60);
         }
         
         // Update summary badge
@@ -1104,6 +1113,10 @@
     if (!eqWrap) {
       eqWrap = document.createElement("details");
       eqWrap.id = "wrap-acoustic-equalizer";
+      eqWrap.open = localStorage.getItem("eq_open") !== "false"; // Open by default!
+      eqWrap.ontoggle = () => {
+        localStorage.setItem("eq_open", String(eqWrap.open));
+      };
       eqWrap.style.cssText = "background: rgba(0,0,0,0.32); border: 1px solid rgba(56,189,248,0.25); border-radius: 12px; padding: 6px 10px; margin: 6px 0;";
       eqWrap.innerHTML = `
         <summary style="cursor: pointer; font-size: 0.82rem; font-weight: 700; color: #38bdf8; display: flex; justify-content: space-between; align-items: center; user-select: none;">
@@ -1727,8 +1740,6 @@
           : (t.genre ? `<span style="background:rgba(255,255,255,0.08); padding:1px 5px; border-radius:5px; font-size:0.68rem; color:#cbd5e1;">${escapeHtml(t.genre)}</span>` : "");
         let acousticBadge = typeof t.energy === "number" ? `<span style="color:#fbbf24; font-size:0.68rem;" title="Энергия: ${t.energy}%, Темп: ${t.tempo || 'н/д'} BPM">⚡ ${t.energy}%</span>` : "";
         let localBadge = t.is_local ? `<span style="background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid rgba(34,197,94,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;" title="Трек уже в локальной коллекции">💿 В коллекции</span>` : "";
-        let acousticBadge = typeof t.energy === "number" ? `<span style="color:#fbbf24; font-size:0.68rem;" title="Энергия: ${t.energy}%, Темп: ${t.tempo || 'н/д'} BPM">⚡ ${t.energy}%</span>` : "";
-        let localBadge = t.is_local ? `<span style="background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid rgba(34,197,94,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;" title="Трек уже в локальной коллекции">💿 В коллекции</span>` : "";
 
         return `
           <li class="addon-catalog-item" data-id="${t.id}" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-album="${escapeHtml(t.album)}" data-duration="${t.duration_sec}" style="display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; margin-bottom:3px; cursor:pointer; transition:background 0.15s; background:rgba(255,255,255,0.02); border-bottom:1px solid rgba(255,255,255,0.04);">
@@ -1947,7 +1958,9 @@
     loadRadioHistory();
   }
 
-  // Periodic polling for UI
+  // Periodic polling for non-queue UI elements only
+  // NOTE: updateQueueOrigins is intentionally NOT here — it runs reactively
+  //       after each real queue DOM rebuild to prevent 2-second strobe flicker.
   setInterval(() => {
     hookPlayerFunctions();
     injectHeaderBadge();
@@ -1959,7 +1972,6 @@
     updateCacheStats();
     updateIngestionStatus();
     updateNowPlayingOrigin();
-    updateQueueOrigins();
 
     // Keep active tab state consistent
     if (activeQueueTab === "history") {

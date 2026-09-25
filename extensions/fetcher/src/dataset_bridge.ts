@@ -15,6 +15,86 @@ export function applyAcousticBiases(seed: AcousticFeatures12D, biases?: Acoustic
   };
 }
 
+// Resolves authentic 12D acoustic seed for any track (direct catalog match, audio features table, or 512D nearest acoustic donor)
+export function resolveSeedAcousticFeatures(trackId: number, db = getDb()): AcousticFeatures12D {
+  // 1. Direct match in external_catalog
+  try {
+    const directRow = db.prepare(`
+      SELECT ec.features_json 
+      FROM tracks t
+      JOIN external_catalog ec ON ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE
+      WHERE t.id = ? AND ec.features_json IS NOT NULL
+      LIMIT 1
+    `).get(trackId) as { features_json?: string } | undefined;
+
+    if (directRow?.features_json) {
+      const parsed = JSON.parse(directRow.features_json);
+      if (parsed && typeof parsed.tempo === "number") return parsed;
+    }
+  } catch {}
+
+  // 2. Check if features table has bpm / mode / lufs for this track
+  try {
+    const fRow = db.prepare(`
+      SELECT bpm, mode, lufs, embedding FROM features WHERE track_id = ?
+    `).get(trackId) as { bpm?: number; mode?: string; lufs?: number; embedding?: Uint8Array } | undefined;
+
+    // 3. Find closest 512D acoustic donor among tracks with known 12D features
+    if (fRow?.embedding && fRow.embedding.length === 2048) {
+      const u8 = new Uint8Array(fRow.embedding);
+      const targetVec = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+
+      // Fetch sample of library tracks with both 512D embedding and external 12D features
+      const donorRows = db.prepare(`
+        SELECT f.embedding, ec.features_json
+        FROM tracks t
+        JOIN features f ON f.track_id = t.id
+        JOIN external_catalog ec ON ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE
+        WHERE f.status = 'ready' AND length(f.embedding) = 2048 AND ec.features_json IS NOT NULL
+        LIMIT 60
+      `).all() as { embedding: Uint8Array; features_json: string }[];
+
+      let bestScore = -1;
+      let bestFeatures: AcousticFeatures12D | null = null;
+
+      for (const donor of donorRows) {
+        const dU8 = new Uint8Array(donor.embedding);
+        const dF32 = new Float32Array(dU8.buffer, dU8.byteOffset, dU8.byteLength / 4);
+        let dot = 0;
+        for (let i = 0; i < 512; i++) dot += targetVec[i] * dF32[i];
+        if (dot > bestScore) {
+          bestScore = dot;
+          try {
+            bestFeatures = JSON.parse(donor.features_json);
+          } catch {}
+        }
+      }
+
+      if (bestFeatures) {
+        if (fRow.bpm && fRow.bpm > 40 && fRow.bpm < 240) {
+          bestFeatures.tempo = fRow.bpm;
+        }
+        return bestFeatures;
+      }
+    }
+  } catch {}
+
+  // 4. Default graceful fallback
+  return {
+    danceability: 0.55,
+    energy: 0.55,
+    key: 0,
+    loudness: -8,
+    mode: 1,
+    speechiness: 0.05,
+    acousticness: 0.25,
+    instrumentalness: 0.05,
+    liveness: 0.1,
+    valence: 0.5,
+    tempo: 115
+  };
+}
+
 // Normalized distance in 12D acoustic space
 export function compute12DDistance(a: AcousticFeatures12D, b: AcousticFeatures12D): number {
   const dDance = Math.pow(a.danceability - b.danceability, 2);
@@ -422,6 +502,82 @@ export function syncAllLocalTracksTo12DCatalog(db = getDb()): number {
 
   console.log(`[12D-bridge] Successfully projected and indexed ${count} tracks into 12D catalog!`);
   return count;
+}
+
+let cachedCentroid: Float32Array | null = null;
+let lastCentroidCompute = 0;
+
+// Compute normalized 512D acoustic centroid of user favorites
+export function getFavoritesCentroid(db = getDb()): Float32Array | null {
+  const now = Date.now();
+  if (cachedCentroid && now - lastCentroidCompute < 60000) {
+    return cachedCentroid;
+  }
+  let rows = db.prepare(`
+    SELECT f.embedding
+    FROM favorites fav
+    JOIN features f ON f.track_id = fav.track_id
+    WHERE f.embedding IS NOT NULL AND length(f.embedding) = 2048
+  `).all() as { embedding: Uint8Array | ArrayBuffer }[];
+
+  if (rows.length === 0) {
+    rows = db.prepare(`
+      SELECT f.embedding
+      FROM tracks t
+      JOIN features f ON f.track_id = t.id
+      WHERE f.embedding IS NOT NULL AND length(f.embedding) = 2048
+      ORDER BY t.play_count DESC
+      LIMIT 100
+    `).all() as { embedding: Uint8Array | ArrayBuffer }[];
+  }
+
+  if (rows.length === 0) return null;
+
+  const centroid = new Float32Array(512);
+  let count = 0;
+  for (const r of rows) {
+    try {
+      const u8 = new Uint8Array(r.embedding);
+      const f32 = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+      if (f32.length === 512) {
+        for (let i = 0; i < 512; i++) {
+          centroid[i] += f32[i];
+        }
+        count++;
+      }
+    } catch {}
+  }
+
+  if (count === 0) return null;
+
+  let norm = 0;
+  for (let i = 0; i < 512; i++) {
+    centroid[i] /= count;
+    norm += centroid[i] * centroid[i];
+  }
+  norm = Math.sqrt(norm);
+  if (norm > 0) {
+    for (let i = 0; i < 512; i++) {
+      centroid[i] /= norm;
+    }
+  }
+
+  cachedCentroid = centroid;
+  lastCentroidCompute = now;
+  return centroid;
+}
+
+// Compute cosine similarity between 512D track embedding and favorites centroid
+export function score512AgainstCentroid(vec: Float32Array, centroid: Float32Array): number {
+  let dot = 0;
+  let normA = 0;
+  for (let i = 0; i < 512; i++) {
+    dot += vec[i] * centroid[i];
+    normA += vec[i] * vec[i];
+  }
+  normA = Math.sqrt(normA);
+  const rawCos = normA > 0 ? dot / normA : 0;
+  return Math.max(0.01, Math.min(0.99, rawCos));
 }
 
 // Predict top catalog tracks matching user taste that can be pre-indexed into 512D

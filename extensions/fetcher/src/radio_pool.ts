@@ -1,7 +1,7 @@
 // extensions/fetcher/src/radio_pool.ts: Speculative Pre-Indexing Pool for Zero-Latency Radio
 import { config } from "./config.ts";
-import { getDb, getActiveSession, findTrackByArtistTitle, has512Embedding, getRadioSettings } from "./db.ts";
-import { find12DCandidates, getColdStartSeeds } from "./dataset_bridge.ts";
+import { getDb, getActiveSession, findTrackByArtistTitle, has512Embedding, getRadioSettings, isTrackFamiliar } from "./db.ts";
+import { find12DCandidates, getColdStartSeeds, getFavoritesCentroid, score512AgainstCentroid, resolveSeedAcousticFeatures } from "./dataset_bridge.ts";
 import { fetchTrackAudio } from "./fetcher.ts";
 import { compute512DEmbedding } from "./embedder_client.ts";
 import { enforceLruCache } from "./lru.ts";
@@ -12,20 +12,19 @@ export class RadioPoolManager {
   private isManaging = false;
   private isBusy = false;
   private checkIntervalId?: ReturnType<typeof setInterval>;
-  private readonly targetPoolSize = 5;
+  private readonly targetPoolSize = 2;
   private isProcessing = false;
-
 
   public start(): void {
     if (this.isManaging) return;
     this.isManaging = true;
     console.log("[radio-pool] Started Active 512D Pre-Indexing Pool Manager.");
-    // Periodic check every 15s to keep fresh diverse candidates in pool
+    // Periodic check every 30s to keep warm candidates in pool without wasting CPU
     this.checkIntervalId = setInterval(() => {
       this.maintainPool().catch(err => {
         console.error("[radio-pool] Error maintaining pool:", err);
       });
-    }, 15000);
+    }, 30000);
     // Initial run
     this.maintainPool().catch(() => {});
   }
@@ -41,6 +40,13 @@ export class RadioPoolManager {
 
   public getPool(): RadioPoolCandidate[] {
     return [...this.pool];
+  }
+
+  // Returns all hot candidates that have audio and 512D embeddings ready, sorted by 512D score descending
+  public getReadyPool(): RadioPoolCandidate[] {
+    return this.pool
+      .filter(c => c.isReady && !!c.trackId)
+      .sort((a, b) => (b.score || 0) - (a.score || 0));
   }
 
   public async refreshPool(biases?: AcousticBiases): Promise<void> {
@@ -112,40 +118,22 @@ export class RadioPoolManager {
     // Read active biases if not passed
     const activeBiases = biases || (session?.id ? getRadioSettings(session.id, db).biases : undefined);
 
-    // Determine current acoustic seed
-    let seedFeatures: AcousticFeatures12D | undefined;
-
-    if (session && session.currentId) {
-      const curRow = db.prepare(`
-        SELECT ec.features_json 
-        FROM tracks t
-        LEFT JOIN external_catalog ec ON LOWER(ec.artist) = LOWER(t.artist) AND LOWER(ec.title) = LOWER(t.title)
-        WHERE t.id = ?
-      `).get(session.currentId) as { features_json?: string } | undefined;
-
-      if (curRow?.features_json) {
-        try {
-          seedFeatures = JSON.parse(curRow.features_json);
-        } catch {}
-      }
-    }
-
-    // Default neutral seed if no current track features
-    if (!seedFeatures) {
-      seedFeatures = {
-        danceability: 0.6,
-        energy: 0.6,
-        key: 0,
-        loudness: -8,
-        mode: 1,
-        speechiness: 0.05,
-        acousticness: 0.2,
-        instrumentalness: 0,
-        liveness: 0.1,
-        valence: 0.5,
-        tempo: 120
-      };
-    }
+    // Determine authentic acoustic seed (using catalog match or 512D nearest acoustic donor)
+    const seedFeatures: AcousticFeatures12D = session?.currentId
+      ? resolveSeedAcousticFeatures(session.currentId, db)
+      : {
+          danceability: 0.55,
+          energy: 0.55,
+          key: 0,
+          loudness: -8,
+          mode: 1,
+          speechiness: 0.05,
+          acousticness: 0.25,
+          instrumentalness: 0.05,
+          liveness: 0.1,
+          valence: 0.5,
+          tempo: 115
+        };
 
     const needed = this.targetPoolSize - this.pool.length;
     const candidates = find12DCandidates(seedFeatures, needed * 2, excludeSet, db, activeBiases);
@@ -154,6 +142,10 @@ export class RadioPoolManager {
       if (this.pool.length >= this.targetPoolSize) break;
 
       const existing = findTrackByArtistTitle(hit.artist, hit.title, db);
+      // Skip tracks already familiar to user in listening_history or favorites
+      if (existing && isTrackFamiliar(existing.id, db)) {
+        continue;
+      }
       const isAlreadyEmbedded = existing ? existing.hasEmbedding : false;
 
       this.pool.push({
@@ -197,6 +189,7 @@ export class RadioPoolManager {
       // 1. Fetch audio into dynamic cache
       const fetchRes = await fetchTrackAudio(candidate.artist, candidate.title, {
         mode: "cache",
+        preferredYtdlId: candidate.ytdlId,
         fallbackSearch: true
       });
 
@@ -210,14 +203,39 @@ export class RadioPoolManager {
       candidate.trackId = fetchRes.trackId;
       candidate.filePath = fetchRes.filePath;
 
-      // 2. Compute 512D embedding in background if missing
-      const alreadyHas512 = has512Embedding(fetchRes.trackId);
+      // 2. Compute 512D CLAP embedding & score against favorites centroid
+      const db = getDb();
+      let alreadyHas512 = has512Embedding(fetchRes.trackId);
       if (!alreadyHas512) {
-        compute512DEmbedding(fetchRes.filePath, fetchRes.trackId).catch(() => {});
+        try {
+          await compute512DEmbedding(fetchRes.filePath, fetchRes.trackId);
+          alreadyHas512 = has512Embedding(fetchRes.trackId);
+        } catch (embErr) {
+          console.warn(`[radio-pool] 512D CLAP embedding calculation failed:`, embErr);
+        }
       }
 
-      candidate.has512Embedding = true;
+      if (alreadyHas512) {
+        const featRow = db.prepare(`SELECT embedding FROM features WHERE track_id = ? AND length(embedding) = 2048`).get(fetchRes.trackId) as { embedding?: Uint8Array } | undefined;
+        if (featRow?.embedding) {
+          try {
+            const u8 = new Uint8Array(featRow.embedding);
+            const f32 = new Float32Array(u8.buffer, u8.byteOffset, u8.byteLength / 4);
+            const centroid = getFavoritesCentroid(db);
+            if (centroid) {
+              const score512 = score512AgainstCentroid(f32, centroid);
+              candidate.score = Math.round(score512 * 100) / 100;
+              candidate.explanation = `🧠 512D Отбор (${Math.round(score512 * 100)}% вкус)`;
+            }
+          } catch {}
+        }
+      }
+
+      candidate.has512Embedding = alreadyHas512;
       candidate.isReady = true;
+
+      // Sort pool so highest 512D scored candidates are consumed first
+      this.pool.sort((a, b) => (b.score || 0) - (a.score || 0));
 
       // 3. Keep cache within 3 GB
       await enforceLruCache();
@@ -227,7 +245,7 @@ export class RadioPoolManager {
         await fetch(`${config.playerUrl}/api/reload`, { method: "POST" });
       } catch {}
 
-      console.log(`[radio-pool] Candidate is hot and ready in pool: ${candidate.artist} - ${candidate.title}`);
+      console.log(`[radio-pool] Candidate is hot and ready in pool: ${candidate.artist} - ${candidate.title} (512D score: ${candidate.score || 0})`);
     } catch (err) {
       console.error(`[radio-pool] Error indexing pool candidate:`, err);
       this.pool = this.pool.filter(c => c !== candidate);

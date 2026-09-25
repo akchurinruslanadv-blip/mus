@@ -23,22 +23,56 @@ export async function fetchAudioStream(
   };
 
   // Determine search strategy
-  // 1. Direct URL/ID, 2. YouTube Music search, 3. YouTube fallback
+  // 0. Cached ytdl_id check, 1. Direct URL/ID, 2. YouTube fallback search
+  let knownYtdlId = options.preferredYtdlId;
   const isDirectUrl = queryOrUrl.startsWith("http://") || 
                       queryOrUrl.startsWith("https://") || 
                       /^[a-zA-Z0-9_-]{11}$/.test(queryOrUrl);
 
+  // If not direct URL, check if ytdl_id is already cached in SQLite (tracks or external_catalog)
+  if (!knownYtdlId && !isDirectUrl) {
+    try {
+      const db = getDb();
+      const dashIdx = queryOrUrl.indexOf(" - ");
+      if (dashIdx > 0) {
+        const a = queryOrUrl.slice(0, dashIdx).trim();
+        const t = queryOrUrl.slice(dashIdx + 3).trim();
+        const catRow = db.prepare(`
+          SELECT ytdl_id FROM external_catalog 
+          WHERE (LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?)))
+            AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
+          LIMIT 1
+        `).get(a, t) as { ytdl_id?: string } | undefined;
+        if (catRow?.ytdl_id) knownYtdlId = catRow.ytdl_id;
+
+        if (!knownYtdlId) {
+          const tRow = db.prepare(`
+            SELECT ytdl_id FROM tracks 
+            WHERE (LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?)))
+              AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
+            LIMIT 1
+          `).get(a, t) as { ytdl_id?: string } | undefined;
+          if (tRow?.ytdl_id) knownYtdlId = tRow.ytdl_id;
+        }
+      }
+    } catch {}
+  }
+
   const strategies: { source: "youtube_music" | "youtube_fallback"; query: string }[] = [];
 
-  if (isDirectUrl) {
+  if (knownYtdlId) {
+    strategies.push({
+      source: "youtube_fallback",
+      query: `https://www.youtube.com/watch?v=${knownYtdlId}`
+    });
+  } else if (isDirectUrl) {
     strategies.push({ source: "youtube_music", query: queryOrUrl });
   } else {
-    // Stage 1: YouTube search with audio hint to target music releases
+    // Only search by keywords when we do NOT have a known ytdl_id!
     strategies.push({ 
       source: "youtube_fallback", 
       query: `ytsearch1:${queryOrUrl} audio` 
     });
-    // Stage 2: Secondary YouTube search fallback without extra keyword
     if (options.fallbackSearch !== false) {
       strategies.push({ 
         source: "youtube_fallback", 
@@ -184,7 +218,8 @@ export async function fetchAudioStream(
     title,
     artist,
     duration: finalDuration,
-    fileSize: finalSize
+    fileSize: finalSize,
+    ytdlId: finalYtdlId
   }, db);
 
   // Permanently preserve track metadata and source URL in external_catalog

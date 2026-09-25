@@ -85,6 +85,14 @@ export function initSchema(db: Database): void {
     db.exec(`ALTER TABLE radio_settings ADD COLUMN biases_json TEXT DEFAULT '{}';`);
   } catch {}
 
+  // 5. Cache ytdl_id in tracks table for zero-latency direct downloads
+  try {
+    db.exec(`ALTER TABLE tracks ADD COLUMN ytdl_id TEXT;`);
+  } catch {}
+  try {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_tracks_ytdl_id ON tracks(ytdl_id);`);
+  } catch {}
+
   // Indices for fast search
 
   db.prepare(`
@@ -126,7 +134,87 @@ export function initSchema(db: Database): void {
       `).run();
     }
   } catch {}
+
+  // 6. Automatic Backfill: Sync Favorites into Listening History as familiar history
+  backfillFavoritesToHistory(db);
 }
+
+// Automatic Favorites Backfill into Listening History & rec_stats
+export function backfillFavoritesToHistory(db: Database): number {
+  try {
+    const hasFavs = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='favorites'`).get();
+    const hasHist = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='listening_history'`).get();
+    if (!hasFavs || !hasHist) return 0;
+
+    const rows = db.prepare(`
+      SELECT f.track_id, COALESCE(f.added_at, datetime('now', '-30 days')) as added_at,
+             COALESCE(t.duration, 180) as duration
+      FROM favorites f
+      JOIN tracks t ON t.id = f.track_id
+      WHERE f.track_id NOT IN (SELECT DISTINCT track_id FROM listening_history)
+    `).all() as { track_id: number; added_at: string; duration: number }[];
+
+    if (rows.length === 0) return 0;
+
+    console.log(`[db] Backfilling ${rows.length} favorite tracks into listening_history as familiar history...`);
+    db.exec("BEGIN TRANSACTION;");
+    try {
+      const insertHist = db.prepare(`
+        INSERT INTO listening_history(track_id, ts, source, action, daypart, weekday, duration_sec, listened_sec, reason)
+        VALUES (?, ?, 'favorites', 'track_end', 'day', 0, ?, ?, 'completed')
+      `);
+      const upsertStats = db.prepare(`
+        INSERT INTO rec_stats(track_id, shown, completed, updated_at)
+        VALUES (?, 1, 1, ?)
+        ON CONFLICT(track_id) DO UPDATE SET
+          shown = MAX(rec_stats.shown, 1),
+          completed = MAX(rec_stats.completed, 1),
+          updated_at = excluded.updated_at
+      `);
+
+      for (const r of rows) {
+        insertHist.run(r.track_id, r.added_at, r.duration, r.duration);
+        upsertStats.run(r.track_id, r.added_at);
+      }
+      db.exec("COMMIT;");
+      console.log(`[db] Successfully backfilled ${rows.length} favorites into listening_history and rec_stats.`);
+      return rows.length;
+    } catch (err) {
+      db.exec("ROLLBACK;");
+      console.error("[db] Error backfilling favorites:", err);
+      return 0;
+    }
+  } catch (e) {
+    console.warn("[db] backfillFavoritesToHistory check error:", e);
+    return 0;
+  }
+}
+
+// Familiarity check: has track ever been listened to or favorited?
+export function isTrackFamiliar(trackId: number, db = getDb()): boolean {
+  try {
+    const row = db.prepare(`
+      SELECT 1 FROM listening_history WHERE track_id = ? LIMIT 1
+    `).get(trackId);
+    if (row) return true;
+    const fav = db.prepare(`SELECT 1 FROM favorites WHERE track_id = ? LIMIT 1`).get(trackId);
+    return !!fav;
+  } catch {
+    return false;
+  }
+}
+
+export function getFamiliarTrackIds(db = getDb()): Set<number> {
+  const ids = new Set<number>();
+  try {
+    const hist = db.prepare(`SELECT DISTINCT track_id FROM listening_history`).all() as { track_id: number }[];
+    for (const h of hist) ids.add(h.track_id);
+    const favs = db.prepare(`SELECT track_id FROM favorites`).all() as { track_id: number }[];
+    for (const f of favs) ids.add(f.track_id);
+  } catch {}
+  return ids;
+}
+
 
 // Track Pinning (💾 Сохранить навсегда)
 export function isTrackPinned(trackId: number, db = getDb()): boolean {
@@ -201,6 +289,7 @@ export function upsertTrack(meta: {
   album?: string;
   duration?: number;
   fileSize?: number;
+  ytdlId?: string;
 }, db = getDb()): number {
   const now = new Date().toISOString();
 
@@ -212,22 +301,34 @@ export function upsertTrack(meta: {
   `).get(meta.artist, meta.title) as { id: number } | undefined;
 
   if (existing) {
-    db.prepare(`
-      UPDATE tracks 
-      SET path = ?, duration = COALESCE(?, duration), file_size = COALESCE(?, file_size), is_active = 1, updated_at = ?
-      WHERE id = ?
-    `).run(meta.path, meta.duration || 180, meta.fileSize || 0, now, existing.id);
+    const pathConflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(meta.path, existing.id);
+    if (!pathConflict) {
+      db.prepare(`
+        UPDATE tracks 
+        SET path = ?, duration = COALESCE(?, duration), file_size = COALESCE(?, file_size),
+            ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ?
+        WHERE id = ?
+      `).run(meta.path, meta.duration || 180, meta.fileSize || 0, meta.ytdlId || null, now, existing.id);
+    } else {
+      db.prepare(`
+        UPDATE tracks 
+        SET duration = COALESCE(?, duration), file_size = COALESCE(?, file_size),
+            ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ?
+        WHERE id = ?
+      `).run(meta.duration || 180, meta.fileSize || 0, meta.ytdlId || null, now, existing.id);
+    }
     return existing.id;
   }
 
   db.prepare(`
-    INSERT INTO tracks (path, title, artist, album, duration, file_size, is_active, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+    INSERT INTO tracks (path, title, artist, album, duration, file_size, ytdl_id, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     ON CONFLICT(path) DO UPDATE SET
       title = excluded.title,
       artist = excluded.artist,
       duration = excluded.duration,
       file_size = excluded.file_size,
+      ytdl_id = COALESCE(excluded.ytdl_id, tracks.ytdl_id),
       updated_at = excluded.updated_at
   `).run(
     meta.path,
@@ -236,6 +337,7 @@ export function upsertTrack(meta: {
     meta.album || "Web Stream",
     meta.duration || 180,
     meta.fileSize || 0,
+    meta.ytdlId || null,
     now,
     now
   );
@@ -460,6 +562,47 @@ export interface ReadyTrackCandidate {
   explore: boolean;
   new_boost: boolean;
   cluster_id: number;
+}
+
+// Unheard 512D library candidates (tracks with ready 512D embeddings, never listened to or favorited)
+export function getUnheard512DCandidates(
+  excludeIds: number[],
+  limit = 5,
+  db = getDb()
+): ReadyTrackCandidate[] {
+  const placeholders = excludeIds.length > 0 ? excludeIds.map(() => "?").join(",") : "0";
+  const rows = db.prepare(`
+    SELECT t.id, t.artist, t.title, t.album, t.path, t.duration
+    FROM tracks t
+    JOIN features f ON f.track_id = t.id AND f.status = 'ready' AND f.embedding IS NOT NULL
+    WHERE t.id NOT IN (${placeholders})
+      AND t.id NOT IN (SELECT DISTINCT track_id FROM listening_history)
+      AND t.id NOT IN (SELECT track_id FROM favorites)
+      AND t.is_active = 1
+    ORDER BY RANDOM()
+    LIMIT ?
+  `).all(...excludeIds, limit) as {
+    id: number;
+    artist: string;
+    title: string;
+    album: string;
+    path: string;
+    duration: number;
+  }[];
+
+  return rows.map((r, i) => ({
+    track_id: r.id,
+    artist: r.artist,
+    title: r.title,
+    album: r.album || "Library Discovery",
+    path: r.path,
+    duration: Math.round(r.duration || 180),
+    score: 0.90 - i * 0.04,
+    explanation: "✨ Непрослушанный трек из 512D-медиатеки",
+    explore: true,
+    new_boost: true,
+    cluster_id: -1
+  }));
 }
 
 export function get512DCandidates(

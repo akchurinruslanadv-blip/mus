@@ -6,12 +6,13 @@ import {
   addIngestionTasks, 
   clearIngestionQueue, 
   get512DCandidates, 
+  getUnheard512DCandidates,
   getFavoriteCandidates,
   isFavorite,
+  isTrackFamiliar,
   getActiveSession,
   updateSessionQueue, 
   resetSessionExcludeIfExhausted,
-  getDiscoveryRatio,
   setDiscoveryRatio,
   getRadioSettings,
   setRadioSettings,
@@ -26,7 +27,8 @@ import {
   getColdStartSeeds, 
   findPredictiveCatalogTracks, 
   searchExternalCatalog,
-  syncAllLocalTracksTo12DCatalog 
+  syncAllLocalTracksTo12DCatalog,
+  resolveSeedAcousticFeatures 
 } from "./dataset_bridge.ts";
 import { ingestionWorker } from "./ingestion_worker.ts";
 import { radioPoolManager } from "./radio_pool.ts";
@@ -74,34 +76,22 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
   const queue: any[] = [];
   const selectedIds = new Set<number>([currentTrackId, ...excludeRecentIds]);
 
-  // Seed features from current track if available
-  let seedFeatures: AcousticFeatures12D = {
-    danceability: 0.6,
-    energy: 0.6,
-    key: 0,
-    loudness: -8,
-    mode: 1,
-    speechiness: 0.05,
-    acousticness: 0.2,
-    instrumentalness: 0,
-    liveness: 0.1,
-    valence: 0.5,
-    tempo: 120
-  };
-  if (currentTrackId) {
-    try {
-      const curRow = db.prepare(`
-        SELECT ec.features_json 
-        FROM tracks t
-        LEFT JOIN external_catalog ec ON ec.artist = t.artist COLLATE NOCASE AND ec.title = t.title COLLATE NOCASE
-        WHERE t.id = ?
-        LIMIT 1
-      `).get(currentTrackId) as { features_json?: string } | undefined;
-      if (curRow?.features_json) {
-        seedFeatures = JSON.parse(curRow.features_json);
-      }
-    } catch {}
-  }
+  // Seed features from current track (direct catalog match or closest 512D acoustic donor)
+  const seedFeatures: AcousticFeatures12D = currentTrackId
+    ? resolveSeedAcousticFeatures(currentTrackId, db)
+    : {
+        danceability: 0.55,
+        energy: 0.55,
+        key: 0,
+        loudness: -8,
+        mode: 1,
+        speechiness: 0.05,
+        acousticness: 0.25,
+        instrumentalness: 0.05,
+        liveness: 0.1,
+        valence: 0.5,
+        tempo: 115
+      };
 
   // 1. Gather Favorite candidates
   let favCandidates: any[] = [];
@@ -130,9 +120,46 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
       for (const r of rows) excludeTitles.add(`${r.artist} - ${r.title}`.toLowerCase());
     } catch {}
 
-    // When biases are actively set by user, direct 12D candidate generation takes top priority!
-    if (hasBiases) {
-      const hits = find12DCandidates(seedFeatures, targetDiscovery * 2, excludeTitles, db, biases);
+    // A. Check ready items from radio pool (pre-downloaded, 512D-scored against centroid)
+    // getReadyPool() returns candidates sorted by 512D taste similarity score descending
+    const readyPool = radioPoolManager.getReadyPool().filter(c =>
+      c.trackId &&
+      !selectedIds.has(c.trackId) &&
+      !isTrackFamiliar(c.trackId, db)
+    );
+    for (const pc of readyPool) {
+      if (discCandidates.length >= targetDiscovery) break;
+      discCandidates.push({
+        track_id: pc.trackId,
+        artist: pc.artist,
+        title: pc.title,
+        album: "Radio Discovery",
+        path: pc.filePath || "",
+        duration: 180,
+        score: pc.score || 0.85,
+        explanation: pc.explanation || "🧠 512D акустическое открытие",
+        explore: true,
+        new_boost: true,
+        cluster_id: -1
+      });
+      selectedIds.add(pc.trackId!);
+    }
+
+    // B. Unheard 512D library candidates (tracks with ready 512D embeddings, never listened to)
+    if (discCandidates.length < targetDiscovery) {
+      const needed = targetDiscovery - discCandidates.length;
+      const unheardLib = getUnheard512DCandidates(Array.from(selectedIds), needed * 2, db);
+      for (const cand of unheardLib) {
+        if (discCandidates.length >= targetDiscovery) break;
+        discCandidates.push(cand);
+        selectedIds.add(cand.track_id);
+      }
+    }
+
+    // C. Direct 12D Catalog candidate generation if still below target (honoring user biases)
+    if (discCandidates.length < targetDiscovery) {
+      const needed = targetDiscovery - discCandidates.length;
+      const hits = find12DCandidates(seedFeatures, needed * 2, excludeTitles, db, biases);
       for (const hit of hits) {
         if (discCandidates.length >= targetDiscovery) break;
         const safeName = `${hit.artist} - ${hit.title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
@@ -142,7 +169,8 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
           title: hit.title,
           artist: hit.artist,
           album: hit.album || "Radio Discovery",
-          duration: 180
+          duration: 180,
+          ytdlId: hit.ytdlId
         }, db);
 
         discCandidates.push({
@@ -160,66 +188,6 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
         });
         selectedIds.add(trackId);
         excludeTitles.add(`${hit.artist} - ${hit.title}`.toLowerCase());
-      }
-    }
-
-    // A. Check ready items from radio pool if more candidates needed
-    if (discCandidates.length < targetDiscovery) {
-      const readyPool = radioPoolManager.getPool().filter(c => 
-        c.isReady && 
-        c.trackId && 
-        !selectedIds.has(c.trackId) &&
-        !isFavorite(c.trackId, db)
-      );
-      for (const pc of readyPool) {
-        if (discCandidates.length >= targetDiscovery) break;
-        discCandidates.push({
-          track_id: pc.trackId,
-          artist: pc.artist,
-          title: pc.title,
-          album: "Radio Discovery",
-          path: pc.filePath || "",
-          duration: 180,
-          score: pc.score || 0.85,
-          explanation: "512D акустическое открытие",
-          explore: true,
-          new_boost: true,
-          cluster_id: -1
-        });
-        selectedIds.add(pc.trackId!);
-      }
-    }
-
-    // B. Direct 12D Catalog candidate generation if still below target
-    if (discCandidates.length < targetDiscovery) {
-      const needed = targetDiscovery - discCandidates.length;
-      const hits = find12DCandidates(seedFeatures, needed * 2, excludeTitles, db, biases);
-      for (const hit of hits) {
-        if (discCandidates.length >= targetDiscovery) break;
-        const safeName = `${hit.artist} - ${hit.title}`.replace(/[\\/:*?"<>|]/g, "_").slice(0, 100);
-        const targetPath = path.join(config.dynamicDir, `${safeName}.webm`);
-        const trackId = upsertTrack({
-          path: targetPath,
-          title: hit.title,
-          artist: hit.artist,
-          album: hit.album || "Radio Discovery",
-          duration: 180
-        }, db);
-
-        discCandidates.push({
-          track_id: trackId,
-          artist: hit.artist,
-          title: hit.title,
-          album: hit.album || "Radio Discovery",
-          path: targetPath,
-          duration: 180,
-          score: hit.similarity,
-          explanation: hit.reason || "12D подбор настроения",
-          explore: true,
-          new_boost: true,
-          cluster_id: -1
-        });
-        selectedIds.add(trackId);
       }
     }
   }
@@ -241,6 +209,27 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
         queue.push(favCandidates[favIdx++]);
       } else if (discIdx < discCandidates.length) {
         queue.push(discCandidates[discIdx++]);
+      }
+    }
+  }
+
+  // Zero-Stall Guarantee: If the immediate next track (queue[0]) is not ready on disk,
+  // promote an already ready track (from favorites, ready pool, or library) to queue[0]!
+  if (queue.length > 1) {
+    const isReadySync = (item: any): boolean => {
+      if (!item?.path) return false;
+      try {
+        return Deno.statSync(item.path).isFile;
+      } catch {
+        return false;
+      }
+    };
+
+    if (!isReadySync(queue[0])) {
+      const readyIdx = queue.findIndex(item => isReadySync(item));
+      if (readyIdx > 0) {
+        const [readyTrack] = queue.splice(readyIdx, 1);
+        queue.unshift(readyTrack);
       }
     }
   }
@@ -951,38 +940,71 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     if (streamMatch && (req.method === "GET" || req.method === "HEAD")) {
       const trackId = parseInt(streamMatch[1], 10);
       const db = getDb();
-      const track = db.prepare(`SELECT id, path, title, artist FROM tracks WHERE id = ?`).get(trackId) as { id: number; path: string; title: string; artist: string } | undefined;
+      const track = db.prepare(`SELECT id, path, title, artist, ytdl_id FROM tracks WHERE id = ?`).get(trackId) as { id: number; path: string; title: string; artist: string; ytdl_id?: string } | undefined;
 
       if (track) {
         let fileExists = track.path ? await Deno.stat(track.path).then(s => s.isFile).catch(() => false) : false;
 
-        // Check if file exists under its YouTube ID filename in dynamic/
-        if (!fileExists && track.path) {
-          const ytdlMatch = track.path.match(/\[([a-zA-Z0-9_-]{11})\]/);
-          if (ytdlMatch) {
-            const altPath = path.join(config.dynamicDir, `${ytdlMatch[1]}.webm`);
-            if (await Deno.stat(altPath).then(s => s.isFile).catch(() => false)) {
-              track.path = altPath;
-              db.prepare(`UPDATE tracks SET path = ? WHERE id = ?`).run(altPath, trackId);
-              fileExists = true;
-            }
+        // 1. Determine preferred YouTube ID
+        let preferredYtdlId = track.ytdl_id;
+        if (!preferredYtdlId && track.path) {
+          const match = track.path.match(/\[([a-zA-Z0-9_-]{11})\]/);
+          if (match) preferredYtdlId = match[1];
+        }
+        if (!preferredYtdlId) {
+          const extRow = db.prepare(`
+            SELECT ytdl_id FROM external_catalog 
+            WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+              AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
+            LIMIT 1
+          `).get(track.artist, track.title) as { ytdl_id?: string } | undefined;
+          if (extRow?.ytdl_id) preferredYtdlId = extRow.ytdl_id;
+        }
+
+        // 2. Check if file exists under its YouTube ID filename in dynamic/
+        if (!fileExists && preferredYtdlId) {
+          const altPath = path.join(config.dynamicDir, `${preferredYtdlId}.webm`);
+          if (await Deno.stat(altPath).then(s => s.isFile).catch(() => false)) {
+            track.path = altPath;
+            fileExists = true;
+            try {
+              const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(altPath, trackId);
+              if (!conflict) {
+                db.prepare(`UPDATE tracks SET path = ?, ytdl_id = ?, is_active = 1 WHERE id = ?`).run(altPath, preferredYtdlId, trackId);
+              }
+            } catch {}
           }
         }
 
-        // If audio file is missing on disk, resolve it on-demand!
+        // 3. If audio file is missing on disk, resolve it on-demand with preferredYtdlId
         if (!fileExists) {
-          console.log(`[stream-proxy] Audio missing on disk for Track ${trackId} ("${track.artist} - ${track.title}"). On-demand resolving...`);
+          console.log(`[stream-proxy] Audio missing on disk for Track ${trackId} ("${track.artist} - ${track.title}"). On-demand resolving (ytdl: ${preferredYtdlId || "searching"})...`);
           const query = `${track.artist} - ${track.title}`.trim();
-          const fetchRes = await fetchAudioStream(query, { mode: "cache" });
+          const fetchRes = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
           if (fetchRes.success && fetchRes.filePath) {
             track.path = fetchRes.filePath;
-            db.prepare(`UPDATE tracks SET path = ?, file_size = ?, is_active = 1, updated_at = ? WHERE id = ?`).run(
-              fetchRes.filePath,
-              fetchRes.sizeBytes || 0,
-              new Date().toISOString(),
-              trackId
-            );
             fileExists = true;
+            try {
+              const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(fetchRes.filePath, trackId) as { id: number } | undefined;
+              if (conflict) {
+                db.prepare(`UPDATE tracks SET file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
+                  fetchRes.sizeBytes || 0,
+                  fetchRes.ytdlId || preferredYtdlId || null,
+                  new Date().toISOString(),
+                  trackId
+                );
+              } else {
+                db.prepare(`UPDATE tracks SET path = ?, file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
+                  fetchRes.filePath,
+                  fetchRes.sizeBytes || 0,
+                  fetchRes.ytdlId || preferredYtdlId || null,
+                  new Date().toISOString(),
+                  trackId
+                );
+              }
+            } catch (err) {
+              console.warn(`[stream-proxy] Error updating tracks table for ${trackId}:`, err);
+            }
             try {
               await fetch(`${config.playerUrl}/api/reload`, { method: "POST" });
             } catch {}
@@ -1063,6 +1085,33 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       let data: any = null;
       try { data = JSON.parse(rawText); } catch {}
 
+      // B1. track_start — rebuild our queue and strip data.tracks so app.js
+      //     never sets $("queue").hidden = true in radio mode
+      if (upstreamRes.ok && data && evBody.type === "track_start") {
+        const startTrackId = evBody.track_id || data.current?.id || 0;
+        const sessId = data.session_id || evBody.session_id || "default";
+
+        // In radio mode, always supply our balanced queue and suppress `tracks` array
+        const isRadio = (data.mode === "radio" || !data.fixed);
+        if (isRadio) {
+          data.queue = buildBalancedRadioQueue(startTrackId, 6, [], sessId);
+          // Strip any `tracks` field so app.js takes the `else if (data.queue)` branch
+          // which shows the queue panel instead of the fixed-playlist panel
+          delete data.tracks;
+        }
+
+        if (data.session_id) {
+          updateSessionQueue(data.session_id, startTrackId, data.queue || []);
+        }
+
+        radioPoolManager.maintainPool().catch(() => {});
+
+        return new Response(JSON.stringify(data), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+        });
+      }
+
       if (upstreamRes.ok && data && (evBody.type === "skip" || evBody.type === "track_end")) {
         const playedTrackId = evBody.track_id;
         const sessId = data.session_id || evBody.session_id || "default";
@@ -1073,18 +1122,6 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         }
 
         const db = getDb();
-        const ratio = getDiscoveryRatio(sessId, db);
-        const recentWindow = recents.slice(-25);
-        const isDirectStall = (data.next_id === playedTrackId) || (!data.next && !data.ended) || (data.next_id === 0 && !data.ended);
-        const isRecentRepeat = data.next_id ? recentWindow.includes(data.next_id) : false;
-        const isUpstreamFallback = (data.next_id === 1 && recents.includes(1));
-
-        // Ratio adherence:
-        // If ratio >= 0.7, next track should NOT be an existing favorite!
-        // If ratio <= 0.3, next track MUST be an existing favorite!
-
-        const nextIsFav = data.next_id ? isFavorite(data.next_id, db) : false;
-        const ratioMismatch = (ratio >= 0.7 && nextIsFav) || (ratio <= 0.3 && !nextIsFav);
 
         const isRadio = (data.mode === "radio" || !data.fixed);
 
@@ -1106,6 +1143,8 @@ Deno.serve({ port: config.port }, async (req: Request) => {
             data.queue = balancedQueue.slice(1);
             data.ended = false;
           }
+          // Strip any `tracks` field so app.js never hides the queue panel
+          delete data.tracks;
         }
 
         if (data.next_id && !recents.includes(data.next_id)) {
@@ -1159,7 +1198,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       let html = await upstreamRes.text();
       // Inject UI addon script before </body> with cache busting
       if (!html.includes("/addon/ui.js")) {
-        html = html.replace("</body>", `<script src="/addon/ui.js?v=2.6.0"></script></body>`);
+        html = html.replace("</body>", `<script src="/addon/ui.js?v=2.8.0"></script></body>`);
       }
       const newHeaders = new Headers(upstreamRes.headers);
       newHeaders.delete("content-length");

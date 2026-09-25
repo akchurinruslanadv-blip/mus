@@ -29,15 +29,17 @@ FFMPEG_PATH = BIN_DIR / "ffmpeg.exe"
 DEFAULT_DB = PROJECT_ROOT / "data" / "db" / "musik.db"
 DEFAULT_MODEL = "laion/larger_clap_music_and_speech"
 DEFAULT_SR = 48000
-SEGMENT_SEC = 30.0
+SEGMENT_SEC = 30.0  # Original 30-second windows preserved (100% latent space fidelity)
 
 def utcnow_iso():
     return datetime.now(timezone.utc).isoformat()
 
 def get_audio_duration(file_path: Path) -> float:
-    """Get audio duration in seconds via ffmpeg."""
+    """Get audio duration in seconds via fast ffmpeg header probe."""
     cmd = [
-        str(FFMPEG_PATH), "-i", str(file_path)
+        str(FFMPEG_PATH), "-nostdin", "-v", "error",
+        "-probesize", "32768", "-analyzeduration", "0",
+        "-i", str(file_path)
     ]
     p = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, text=True, errors="replace")
     # Search for Duration: 00:03:25.12
@@ -52,12 +54,19 @@ def get_audio_duration(file_path: Path) -> float:
     return 180.0  # default 3 min fallback
 
 def load_audio_window(file_path: Path, offset_sec: float, duration_sec: float) -> np.ndarray:
-    """Load a specific window of audio as 48kHz mono float32 array using ffmpeg."""
+    """
+    Load a specific audio window as 48kHz mono float32 array using fast seeking.
+    - `-ss` before `-i` enables fast demuxer keyframe seek without decoding earlier frames.
+    - `-vn -sn -dn` completely ignores video streams, album covers, and subtitle streams.
+    - `-threads 1` prevents CPU core contention.
+    """
     cmd = [
         str(FFMPEG_PATH), "-nostdin", "-v", "error",
         "-ss", f"{max(0.0, offset_sec):.3f}",
-        "-t", f"{max(0.1, duration_sec):.3f}",
         "-i", str(file_path),
+        "-t", f"{max(0.1, duration_sec):.3f}",
+        "-vn", "-sn", "-dn",
+        "-threads", "1",
         "-f", "f32le", "-acodec", "pcm_f32le",
         "-ac", "1", "-ar", str(DEFAULT_SR),
         "pipe:1"
@@ -76,30 +85,53 @@ def l2_normalize(vec: np.ndarray) -> np.ndarray:
         return vec.astype(np.float32)
     return (vec / norm).astype(np.float32)
 
+import gc
+
 _MODEL_CACHE = {}
 
-def get_model():
+def get_model(quantize: bool = False, threads: int | None = None):
     if "model" not in _MODEL_CACHE:
         import torch
         from transformers import ClapModel, ClapProcessor
 
-        print(f"[embedder] Loading CLAP model '{DEFAULT_MODEL}' (CPU)...", file=sys.stderr)
+        if threads is None:
+            threads = int(os.environ.get("TORCH_THREADS", "1"))
+        torch.set_num_threads(max(1, threads))
+
+        print(f"[embedder] Loading CLAP model '{DEFAULT_MODEL}' (CPU, threads={threads})...", file=sys.stderr)
         processor = ClapProcessor.from_pretrained(DEFAULT_MODEL)
         model = ClapModel.from_pretrained(DEFAULT_MODEL)
         model.eval()
+
+        should_quantize = quantize or (os.environ.get("EMBEDDER_QUANTIZE") == "1")
+        if should_quantize:
+            print("[embedder] Applying dynamic INT8 quantization to Linear layers (ultra-low RAM mode)...", file=sys.stderr)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model = torch.quantization.quantize_dynamic(
+                    model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+            print("[embedder] Dynamic INT8 quantization ready.", file=sys.stderr)
+
         _MODEL_CACHE["processor"] = processor
         _MODEL_CACHE["model"] = model
+        _MODEL_CACHE["quantized"] = should_quantize
+        _MODEL_CACHE["threads"] = threads
     return _MODEL_CACHE["processor"], _MODEL_CACHE["model"]
 
-def compute_clap_embedding(file_path: Path) -> np.ndarray:
-    """Extract 512D CLAP embedding across 3 windows (start, middle, end)."""
+def compute_clap_embedding(file_path: Path, duration: float | None = None) -> np.ndarray:
+    """
+    Extract 512D CLAP embedding across the author's 3 windows (30s each = 90s audio),
+    using fast FFmpeg keyframe seeking (-ss before -i) and parallel batched PyTorch inference.
+    """
     import torch
 
     processor, model = get_model()
-    duration = get_audio_duration(file_path)
+    if duration is None or duration <= 0:
+        duration = get_audio_duration(file_path)
 
-    # Plan up to 3 non-overlapping windows (30s each)
-    windows = []
+    # 3 windows (30s each = 90s total audio)
     if duration <= SEGMENT_SEC + 1.0:
         windows = [(0.0, duration)]
     else:
@@ -109,27 +141,31 @@ def compute_clap_embedding(file_path: Path) -> np.ndarray:
             (max(0.0, duration - SEGMENT_SEC), SEGMENT_SEC)
         ]
 
-    vecs = []
+    chunks = []
     for offset, seg_dur in windows:
         y = load_audio_window(file_path, offset, seg_dur)
-        if len(y) < 1000:
-            continue
-        inputs = processor(audio=[y], sampling_rate=DEFAULT_SR, return_tensors="pt", padding=True)
-        with torch.no_grad():
-            out = model.get_audio_features(**inputs)
-            if hasattr(out, "pooler_output") and out.pooler_output is not None:
-                feat = out.pooler_output
-            else:
-                feat = out
-            v = feat[0].detach().cpu().float().numpy().reshape(-1)
-            vecs.append(l2_normalize(v))
+        if len(y) >= 1000:
+            chunks.append(y)
 
-    if not vecs:
+    if not chunks:
         raise ValueError(f"Could not extract audio features from {file_path}")
 
-    # Average windows and normalize
-    mean_vec = np.mean(vecs, axis=0)
-    final_vec = l2_normalize(mean_vec)
+    # Step 4: Batch all 3 windows into one parallel forward pass
+    inputs = processor(audio=chunks, sampling_rate=DEFAULT_SR, return_tensors="pt", padding=True)
+    with torch.no_grad():
+        out = model.get_audio_features(**inputs)
+        feat = out.pooler_output if hasattr(out, "pooler_output") and out.pooler_output is not None else out
+        # Normalize each window row
+        normed = feat / torch.norm(feat, p=2, dim=-1, keepdim=True)
+        # Average across the 3 windows
+        mean_vec = torch.mean(normed, dim=0)
+        final_normed = mean_vec / torch.norm(mean_vec, p=2, dim=-1)
+        final_vec = final_normed.detach().cpu().float().numpy().reshape(-1)
+
+    # Cleanup temporary tensors and force garbage collection to keep RSS lean
+    del inputs, out, feat, chunks
+    gc.collect()
+
     if final_vec.shape[0] != 512:
         raise ValueError(f"Expected 512 dimensions, got {final_vec.shape[0]}")
     return final_vec
@@ -168,7 +204,9 @@ class EmbedderHTTPHandler(BaseHTTPRequestHandler):
                 "status": "ok",
                 "service": "musik-clap-embedder",
                 "model": DEFAULT_MODEL,
-                "dim": 512
+                "dim": 512,
+                "quantized": _MODEL_CACHE.get("quantized", False),
+                "threads": _MODEL_CACHE.get("threads", 1)
             }).encode("utf-8"))
             return
         self.send_response(404)
@@ -200,7 +238,8 @@ class EmbedderHTTPHandler(BaseHTTPRequestHandler):
                     self.wfile.write(json.dumps({"ok": False, "error": f"Audio file not found: {audio_file}"}).encode("utf-8"))
                     return
 
-                vec = compute_clap_embedding(audio_path)
+                duration = data.get("duration")
+                vec = compute_clap_embedding(audio_path, duration=duration)
                 if track_id:
                     update_db_feature(Path(db_path), int(track_id), vec)
 
@@ -223,9 +262,9 @@ class EmbedderHTTPHandler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
-def run_server(host="127.0.0.1", port=8790):
+def run_server(host="127.0.0.1", port=8790, quantize: bool = False, threads: int | None = None):
     print(f"[embedder-daemon] Pre-warming CLAP neural network model...", file=sys.stderr)
-    get_model()
+    get_model(quantize=quantize, threads=threads)
     server = HTTPServer((host, port), EmbedderHTTPHandler)
     print(f"[embedder-daemon] CLAP 512D Embedder Service ready on http://{host}:{port}", file=sys.stderr)
     try:
@@ -243,10 +282,13 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="HTTP daemon host (default: 127.0.0.1)")
     parser.add_argument("--track-id", type=int, help="Track ID to update in SQLite")
     parser.add_argument("--db", type=str, default=str(DEFAULT_DB), help="Path to musik.db")
+    parser.add_argument("--duration", type=float, default=None, help="Known track duration in seconds")
+    parser.add_argument("--threads", type=int, default=int(os.environ.get("TORCH_THREADS", "1")), help="PyTorch CPU threads (default: 1)")
+    parser.add_argument("--quantize-int8", action="store_true", default=(os.environ.get("EMBEDDER_QUANTIZE") == "1"), help="Enable dynamic INT8 quantization for ultra-low RAM footprint")
     args = parser.parse_args()
 
     if args.server:
-        run_server(host=args.host, port=args.port)
+        run_server(host=args.host, port=args.port, quantize=args.quantize_int8, threads=args.threads)
         return
 
     if not args.file:
@@ -259,12 +301,12 @@ def main():
         sys.exit(1)
 
     try:
-        vec = compute_clap_embedding(audio_path)
+        get_model(quantize=args.quantize_int8, threads=args.threads)
+        vec = compute_clap_embedding(audio_path, duration=args.duration)
         if args.track_id:
             update_db_feature(Path(args.db), args.track_id, vec)
             print(f"OK: Track {args.track_id} updated with 512D embedding in DB.")
         else:
-            # Print hex or summary
             print(f"OK: Extracted 512D embedding (norm={np.linalg.norm(vec):.4f})")
     except Exception as e:
         import traceback

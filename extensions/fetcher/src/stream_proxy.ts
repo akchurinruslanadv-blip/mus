@@ -11,11 +11,12 @@ export async function resolveTrackAudio(trackId: number): Promise<{
   error?: string;
 }> {
   const db = getDb();
-  const track = db.prepare(`SELECT id, path, title, artist FROM tracks WHERE id = ?`).get(trackId) as {
+  const track = db.prepare(`SELECT id, path, title, artist, ytdl_id FROM tracks WHERE id = ?`).get(trackId) as {
     id: number;
     path: string;
     title: string;
     artist: string;
+    ytdl_id?: string;
   } | undefined;
 
   if (!track) {
@@ -27,12 +28,30 @@ export async function resolveTrackAudio(trackId: number): Promise<{
     return { ready: true, filePath: track.path, source: "disk" };
   }
 
-  // 2. Not on disk: Fetch immediately (On-demand Stream Resolution)
-  const query = `${track.artist} - ${track.title}`.trim();
-  console.log(`[stream-resolver] On-demand fetching audio for Track ${trackId}: "${query}"...`);
+  // 2. Not on disk: Fetch immediately with direct ytdl_id priority
+  let preferredYtdlId = track.ytdl_id;
+  if (!preferredYtdlId) {
+    try {
+      const ext = db.prepare(`
+        SELECT ytdl_id FROM external_catalog 
+        WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+          AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
+        LIMIT 1
+      `).get(track.artist, track.title) as { ytdl_id?: string } | undefined;
+      if (ext?.ytdl_id) preferredYtdlId = ext.ytdl_id;
+    } catch {}
+  }
 
-  const res = await fetchAudioStream(query, { mode: "cache" });
+  const query = `${track.artist} - ${track.title}`.trim();
+  console.log(`[stream-resolver] On-demand fetching Track ${trackId}: "${query}" (ytdl_id: ${preferredYtdlId || "searching"})...`);
+
+  const res = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
   if (res.success && res.filePath) {
+    if (res.ytdlId && (!track.ytdl_id || track.ytdl_id === "")) {
+      try {
+        db.prepare(`UPDATE tracks SET ytdl_id = ? WHERE id = ?`).run(res.ytdlId, trackId);
+      } catch {}
+    }
     return { ready: true, filePath: res.filePath, source: res.source };
   }
 
