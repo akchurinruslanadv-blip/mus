@@ -14,6 +14,17 @@ export class RadioPoolManager {
   private checkIntervalId?: ReturnType<typeof setInterval>;
   private readonly targetPoolSize = 2;
   private isProcessing = false;
+  private activeTask: {
+    trackId?: number;
+    artist: string;
+    title: string;
+    stage: "downloading" | "vectorizing" | "scoring";
+    startedAt: number;
+  } | null = null;
+
+  public getActiveTask() {
+    return this.activeTask ? { ...this.activeTask } : null;
+  }
 
   public start(): void {
     if (this.isManaging) return;
@@ -198,6 +209,13 @@ export class RadioPoolManager {
 
   private async indexCandidate(candidate: RadioPoolCandidate): Promise<void> {
     console.log(`[radio-pool] Speculative pre-indexing candidate: ${candidate.artist} - ${candidate.title}`);
+    this.activeTask = {
+      trackId: candidate.trackId,
+      artist: candidate.artist,
+      title: candidate.title,
+      stage: "downloading",
+      startedAt: Date.now()
+    };
 
     try {
       // 1. Fetch audio into dynamic cache
@@ -214,10 +232,32 @@ export class RadioPoolManager {
         return;
       }
 
+      // Verify downloaded audio file is valid (> 100 KB)
+      try {
+        const st = await Deno.stat(fetchRes.filePath);
+        if (!st.isFile || st.size < 100000) {
+          console.warn(`[radio-pool] Pre-fetched audio too small (${st?.size || 0} bytes) for ${candidate.artist} - ${candidate.title}, discarding`);
+          try { await Deno.remove(fetchRes.filePath); } catch {}
+          this.pool = this.pool.filter(c => c !== candidate);
+          return;
+        }
+      } catch {
+        this.pool = this.pool.filter(c => c !== candidate);
+        return;
+      }
+
       candidate.trackId = fetchRes.trackId;
       candidate.filePath = fetchRes.filePath;
 
       // 2. Compute 512D CLAP embedding & score against favorites centroid
+      this.activeTask = {
+        trackId: fetchRes.trackId,
+        artist: candidate.artist,
+        title: candidate.title,
+        stage: "vectorizing",
+        startedAt: Date.now()
+      };
+
       const db = getDb();
       let alreadyHas512 = has512Embedding(fetchRes.trackId);
       if (!alreadyHas512) {
@@ -294,6 +334,8 @@ export class RadioPoolManager {
     } catch (err) {
       console.error(`[radio-pool] Error indexing pool candidate:`, err);
       this.pool = this.pool.filter(c => c !== candidate);
+    } finally {
+      this.activeTask = null;
     }
   }
 }

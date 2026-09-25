@@ -85,7 +85,10 @@ function getHotStartingTrack(db = getDb()): { id: number; artist: string; title:
 
   for (const c of favCandidates) {
     try {
-      if (c.path && Deno.statSync(c.path).isFile) return c;
+      if (c.path) {
+        const s = Deno.statSync(c.path);
+        if (s.isFile && s.size > 100000) return c;
+      }
     } catch {}
   }
 
@@ -100,7 +103,10 @@ function getHotStartingTrack(db = getDb()): { id: number; artist: string; title:
 
   for (const c of anyCandidates) {
     try {
-      if (c.path && Deno.statSync(c.path).isFile) return c;
+      if (c.path) {
+        const s = Deno.statSync(c.path);
+        if (s.isFile && s.size > 100000) return c;
+      }
     } catch {}
   }
 
@@ -264,7 +270,8 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
     const isReadySync = (item: any): boolean => {
       if (!item?.path) return false;
       try {
-        return Deno.statSync(item.path).isFile;
+        const s = Deno.statSync(item.path);
+        return s.isFile && s.size > 100000;
       } catch {
         return false;
       }
@@ -552,6 +559,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
             t.id,
             t.artist,
             t.title,
+            t.path,
             EXISTS(SELECT 1 FROM pinned_tracks WHERE track_id = t.id) as is_pinned,
             EXISTS(SELECT 1 FROM favorites WHERE track_id = t.id) as is_favorite,
             EXISTS(SELECT 1 FROM features WHERE track_id = t.id AND embedding_dim = 512) as has_512d,
@@ -563,7 +571,19 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           WHERE t.id IN (${placeholders})
         `).all(...ids) as any[];
 
+        const activeTask = radioPoolManager.getActiveTask();
         for (const r of rows) {
+          let onDisk = false;
+          if (r.path) {
+            try {
+              const st = Deno.statSync(r.path);
+              onDisk = st.isFile && st.size > 100000;
+            } catch {}
+          }
+          r.on_disk = onDisk;
+          r.is_downloading = activeStreamDownloads.has(r.id) || (activeTask?.trackId === r.id && activeTask?.stage === "downloading");
+          r.is_vectorizing = (activeTask?.trackId === r.id && activeTask?.stage === "vectorizing");
+
           origins[r.id] = r;
           const k = `${r.artist || ""}|||${r.title || ""}`.toLowerCase();
           originsByQuery[k] = r;
@@ -571,6 +591,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       }
 
       if (queries.length > 0) {
+        const activeTask = radioPoolManager.getActiveTask();
         for (const q of queries) {
           const k = `${q.artist || ""}|||${q.title || ""}`.toLowerCase();
           if (originsByQuery[k]) continue;
@@ -579,7 +600,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           if (q.artist && q.title) {
             row = db.prepare(`
               SELECT 
-                t.id, t.artist, t.title,
+                t.id, t.artist, t.title, t.path,
                 EXISTS(SELECT 1 FROM pinned_tracks WHERE track_id = t.id) as is_pinned,
                 EXISTS(SELECT 1 FROM favorites WHERE track_id = t.id) as is_favorite,
                 EXISTS(SELECT 1 FROM features WHERE track_id = t.id AND embedding_dim = 512) as has_512d,
@@ -595,7 +616,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           if (!row && q.title) {
             row = db.prepare(`
               SELECT 
-                t.id, t.artist, t.title,
+                t.id, t.artist, t.title, t.path,
                 EXISTS(SELECT 1 FROM pinned_tracks WHERE track_id = t.id) as is_pinned,
                 EXISTS(SELECT 1 FROM favorites WHERE track_id = t.id) as is_favorite,
                 EXISTS(SELECT 1 FROM features WHERE track_id = t.id AND embedding_dim = 512) as has_512d,
@@ -609,13 +630,40 @@ Deno.serve({ port: config.port }, async (req: Request) => {
             `).get(q.title);
           }
           if (row) {
+            let onDisk = false;
+            if (row.path) {
+              try {
+                const st = Deno.statSync(row.path);
+                onDisk = st.isFile && st.size > 100000;
+              } catch {}
+            }
+            row.on_disk = onDisk;
+            row.is_downloading = activeStreamDownloads.has(row.id) || (activeTask?.trackId === row.id && activeTask?.stage === "downloading");
+            row.is_vectorizing = (activeTask?.trackId === row.id && activeTask?.stage === "vectorizing");
+
             origins[row.id] = row;
             originsByQuery[k] = row;
           }
         }
       }
 
-      return new Response(JSON.stringify({ origins, originsByQuery }), { headers });
+      const curActive = radioPoolManager.getActiveTask();
+      const readyPool = radioPoolManager.getReadyPool();
+      const totalPool = radioPoolManager.getPool();
+
+      return new Response(JSON.stringify({ 
+        origins, 
+        originsByQuery,
+        pool_status: {
+          ready_count: readyPool.length,
+          total_count: totalPool.length,
+          active_task: curActive ? {
+            artist: curActive.artist,
+            title: curActive.title,
+            stage: curActive.stage
+          } : null
+        }
+      }), { headers });
     } catch (e) {
       return new Response(JSON.stringify({ origins: {}, originsByQuery: {}, error: String(e) }), { headers });
     }
@@ -1100,13 +1148,13 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       const track = db.prepare(`SELECT id, path, title, artist, ytdl_id FROM tracks WHERE id = ?`).get(trackId) as { id: number; path: string; title: string; artist: string; ytdl_id?: string } | undefined;
 
       if (track) {
-        let fileExists = track.path ? await Deno.stat(track.path).then(s => s.isFile).catch(() => false) : false;
+        let fileExists = track.path ? await Deno.stat(track.path).then(s => s.isFile && s.size > 100000).catch(() => false) : false;
         if (!fileExists) {
           const alternate = db.prepare(`
             SELECT id, path, ytdl_id FROM tracks 
             WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE AND id != ?
           `).get(track.artist, track.title, trackId) as { id: number; path: string; ytdl_id?: string } | undefined;
-          if (alternate?.path && await Deno.stat(alternate.path).then(s => s.isFile).catch(() => false)) {
+          if (alternate?.path && await Deno.stat(alternate.path).then(s => s.isFile && s.size > 100000).catch(() => false)) {
             track.path = alternate.path;
             if (alternate.ytdl_id) track.ytdl_id = alternate.ytdl_id;
             fileExists = true;
@@ -1139,7 +1187,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         // 3. Check if file exists under its YouTube ID filename in dynamic/
         if (preferredYtdlId) {
           const altPath = path.join(config.dynamicDir, `${preferredYtdlId}.webm`);
-          if (await Deno.stat(altPath).then(s => s.isFile).catch(() => false)) {
+          if (await Deno.stat(altPath).then(s => s.isFile && s.size > 100000).catch(() => false)) {
             track.path = altPath;
             try {
               const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(altPath, trackId);
@@ -1164,6 +1212,13 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           activeStreamDownloads.delete(trackId);
         }
         if (fetchRes.success && fetchRes.filePath) {
+          const st = await Deno.stat(fetchRes.filePath).catch(() => null);
+          if (!st || !st.isFile || st.size < 100000) {
+            console.warn(`[stream-proxy] Downloaded file ${fetchRes.filePath} is too small (${st?.size || 0} bytes)`);
+            try { await Deno.remove(fetchRes.filePath); } catch {}
+            return new Response("Audio download incomplete", { status: 502 });
+          }
+
           track.path = fetchRes.filePath;
           try {
             const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(fetchRes.filePath, trackId) as { id: number } | undefined;
@@ -1193,6 +1248,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           console.log(`[timing] Stream Track ${trackId} resolved and served in ${tServe.toFixed(1)}ms`);
           return await serveDirectAudioFile(fetchRes.filePath, req);
         }
+        return new Response(JSON.stringify({ error: "Failed to resolve audio stream", track_id: trackId }), { status: 404, headers: { "Content-Type": "application/json" } });
       }
     }
 

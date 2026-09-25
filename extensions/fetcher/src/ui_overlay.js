@@ -1379,6 +1379,42 @@
     });
   }
 
+  function updatePoolStatusBar(pStatus) {
+    const queuePanel = document.querySelector(".queue-panel");
+    if (!queuePanel) return;
+
+    let bar = document.getElementById("addon-pool-status-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.id = "addon-pool-status-bar";
+      bar.style.cssText = "display:flex; align-items:center; justify-content:space-between; gap:8px; margin:4px 0 8px 0; padding:6px 10px; border-radius:8px; font-size:0.75rem; background:rgba(0,0,0,0.25); border:1px solid rgba(255,255,255,0.08); color:var(--muted,#a89f91);";
+      const tabBar = document.getElementById("addon-queue-tab-bar");
+      if (tabBar && tabBar.nextSibling) {
+        queuePanel.insertBefore(bar, tabBar.nextSibling);
+      } else {
+        const queueHead = queuePanel.querySelector(".queue-head");
+        if (queueHead && queueHead.nextSibling) queuePanel.insertBefore(bar, queueHead.nextSibling);
+        else queuePanel.prepend(bar);
+      }
+    }
+
+    const readyCount = pStatus.ready_count || 0;
+    let leftText = `⚡ Пул радио: <strong style="color:#4ade80;">${readyCount} готово</strong>`;
+    let rightText = "";
+    if (pStatus.active_task) {
+      const task = pStatus.active_task;
+      if (task.stage === "downloading") {
+        rightText = `<span style="color:#fbbf24; display:inline-flex; align-items:center; gap:4px;"><span style="display:inline-block; animation:spin 1.5s linear infinite;">⏳</span> Скачивание: ${escapeHtml(task.artist)} - ${escapeHtml(task.title)}</span>`;
+      } else if (task.stage === "vectorizing") {
+        rightText = `<span style="color:#38bdf8; display:inline-flex; align-items:center; gap:4px;">🧠 CLAP 512D: ${escapeHtml(task.artist)} - ${escapeHtml(task.title)}</span>`;
+      }
+    } else {
+      rightText = `<span style="color:var(--muted,#a89f91);">Все треки готовы</span>`;
+    }
+
+    bar.innerHTML = `<div>${leftText}</div><div style="text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:60%;">${rightText}</div>`;
+  }
+
   async function updateQueueOrigins() {
     hookQueueInteractions();
     const playlistEl = document.getElementById("playlist");
@@ -1397,8 +1433,6 @@
     const itemMap = [];
 
     items.forEach(li => {
-      if (li.querySelector(".addon-queue-origin-badge")) return;
-
       let id = null;
       if (li.dataset.trackId) {
         id = parseInt(li.dataset.trackId, 10);
@@ -1441,6 +1475,10 @@
       const origins = data.origins || {};
       const originsByQuery = data.originsByQuery || {};
 
+      if (data.pool_status) {
+        updatePoolStatusBar(data.pool_status);
+      }
+
       itemMap.forEach(({ li, id, artist, title }) => {
         let meta = null;
         if (id && origins[id]) meta = origins[id];
@@ -1451,20 +1489,29 @@
         if (!meta) return;
 
         let badgeHtml = "";
+        if (meta.is_downloading) {
+          badgeHtml += `<span style="background:rgba(234,179,8,0.22); color:#fbbf24; border:1px solid rgba(234,179,8,0.45); padding:1px 6px; border-radius:6px; font-size:0.68rem; font-weight:700; margin-left:6px; display:inline-flex; align-items:center; gap:3px;"><span style="display:inline-block; animation:spin 1.5s linear infinite;">⏳</span> Скачивается</span>`;
+        } else if (meta.is_vectorizing) {
+          badgeHtml += `<span style="background:rgba(56,189,248,0.22); color:#38bdf8; border:1px solid rgba(56,189,248,0.45); padding:1px 6px; border-radius:6px; font-size:0.68rem; font-weight:700; margin-left:6px; display:inline-flex; align-items:center; gap:3px;">🧠 512D CLAP</span>`;
+        } else if (meta.on_disk) {
+          badgeHtml += `<span style="color:#4ade80; font-size:0.68rem; font-weight:700; margin-left:5px;" title="Готов к воспроизведению на диске">✓</span>`;
+        }
+
         if (meta.is_favorite) badgeHtml += `<span style="color:#f87171; font-size:0.72rem; margin-left:4px;" title="Избранное">♥</span>`;
         if (meta.has_512d) badgeHtml += `<span style="color:#38bdf8; font-size:0.68rem; margin-left:4px;" title="512D Вектор">🧠 512D</span>`;
         else if (meta.in_12d) badgeHtml += `<span style="color:#eab308; font-size:0.68rem; margin-left:4px;" title="12D Каталог">⚡ 12D</span>`;
         if (meta.playlist_name) badgeHtml += `<span style="color:#c084fc; font-size:0.68rem; margin-left:4px;" title="Плейлист: ${meta.playlist_name}">📁</span>`;
         if (meta.is_imported) badgeHtml += `<span style="color:#818cf8; font-size:0.68rem; margin-left:4px;" title="Импорт">📥</span>`;
 
-        if (!badgeHtml) return;
-
         const target = li.querySelector("strong") || li.querySelector(".title") || li;
-        if (target && !li.querySelector(".addon-queue-origin-badge")) {
-          const span = document.createElement("span");
-          span.className = "addon-queue-origin-badge";
+        if (target) {
+          let span = target.querySelector(".addon-queue-origin-badge");
+          if (!span) {
+            span = document.createElement("span");
+            span.className = "addon-queue-origin-badge";
+            target.appendChild(span);
+          }
           span.innerHTML = badgeHtml;
-          target.appendChild(span);
         }
       });
     } catch {}
@@ -2436,8 +2483,7 @@
       if (hList) hList.style.display = "none";
     }
 
-    preloadNextTrackFromQueue();
-    hookSkipDebounce();
+    updateQueueOrigins();
   }, 2000);
 
   // Keyboard shortcut: B key for Previous Track
@@ -2458,60 +2504,6 @@
       loadRadioHistory();
     }
   }, 30000);
-
-  // Seamless Browser Audio Preloader
-  let preloadAudio = null;
-  function getPreloadAudio() {
-    if (!preloadAudio) {
-      preloadAudio = document.getElementById("addon-preload-audio");
-      if (!preloadAudio) {
-        preloadAudio = document.createElement("audio");
-        preloadAudio.id = "addon-preload-audio";
-        preloadAudio.preload = "auto";
-        preloadAudio.muted = true;
-        preloadAudio.style.display = "none";
-        document.body.appendChild(preloadAudio);
-      }
-    }
-    return preloadAudio;
-  }
-
-  function preloadNextTrackFromQueue() {
-    try {
-      fetch(`${API_BASE}/api/now`).then(r => r.json()).then(now => {
-        if (now && now.queue && now.queue.length > 0) {
-          const firstQ = now.queue[0];
-          const tid = firstQ.track_id || firstQ.id;
-          if (tid) {
-            const pa = getPreloadAudio();
-            if (pa.dataset.preloadedId !== String(tid)) {
-              pa.dataset.preloadedId = String(tid);
-              pa.src = `/api/stream/${tid}`;
-              console.log(`[ui-preload] Seamlessly buffered next track #${tid} into browser RAM`);
-            }
-          }
-        }
-      }).catch(() => {});
-    } catch {}
-  }
-
-  // Prevent double-click race conditions on skip buttons
-  function hookSkipDebounce() {
-    ["btn-skip", "mini-skip"].forEach(id => {
-      const btn = document.getElementById(id);
-      if (btn && !btn.dataset.debounced) {
-        btn.dataset.debounced = "1";
-        btn.addEventListener("click", () => {
-          btn.style.pointerEvents = "none";
-          btn.style.opacity = "0.5";
-          setTimeout(() => {
-            btn.style.pointerEvents = "auto";
-            btn.style.opacity = "1";
-          }, 800);
-        }, true);
-      }
-    });
-  }
 
   // Initial attempt
   setTimeout(() => {
