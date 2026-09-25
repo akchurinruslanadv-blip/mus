@@ -175,46 +175,63 @@ export function find12DCandidates(
     }
   }
 
+  // Regex to filter out regional folk / corridos / traditional music unless explicitly searched
+  const folkEthnicRegex = /\b(corrido|corridos|ranchera|rancheras|zamba|zambas|folklore|folklorico|norteño|norteno|mariachi|huapango|chalchaleros|halcon de la sierra|ellen gottschalch|gottschalch|forro|cumbia|polka|operetta|cuarteto|chacarera|tonada)\b/i;
+
   let rows: RowType[] = [];
   if (total > 1000) {
-    // Pick a random starting point across the 3.27M catalog to ensure infinite variety on every slider adjustment
-    const randomStartId = Math.floor(Math.random() * Math.max(1, total - 12000));
-    rows = db.prepare(`
-      SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
-      FROM external_catalog
-      WHERE id >= ? AND ${conditions.join(" AND ")}
-      LIMIT 400
-    `).all(randomStartId) as RowType[];
-
-    // If near the tail of the table or very strict condition, wrap around to head
-    if (rows.length < 60) {
-      const wrapRows = db.prepare(`
+    // Multi-chunk sampling: sample across multiple distinct points in the 3.27M catalog
+    // Priority 1: 4 chunks from verified genres (Rock, Pop, Electronic, etc.)
+    // Priority 2: 2 chunks from General (unlabelled, but protected by folk filter)
+    const perChunk = 50;
+    
+    // 1. Verified Genres chunks (4 x 50 = 200 tracks)
+    const verifiedConds = [...conditions, "genre != 'General'", "genre IS NOT NULL"];
+    for (let c = 0; c < 4; c++) {
+      const randOffset = Math.floor(Math.random() * Math.max(1, total - 15000));
+      const chunk = db.prepare(`
         SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
         FROM external_catalog
-        WHERE ${conditions.join(" AND ")}
-        LIMIT 400
-      `).all() as RowType[];
-      rows.push(...wrapRows);
+        WHERE id >= ? AND ${verifiedConds.join(" AND ")}
+        LIMIT ?
+      `).all(randOffset, perChunk) as RowType[];
+      rows.push(...chunk);
+    }
+
+    // 2. Unlabelled / General backup chunks (2 x 50 = 100 tracks)
+    const generalConds = [...conditions, "genre = 'General'"];
+    for (let c = 0; c < 2; c++) {
+      const randOffset = Math.floor(Math.random() * Math.max(1, total - 15000));
+      const chunk = db.prepare(`
+        SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
+        FROM external_catalog
+        WHERE id >= ? AND ${generalConds.join(" AND ")}
+        LIMIT ?
+      `).all(randOffset, perChunk) as RowType[];
+      rows.push(...chunk);
     }
   } else {
     rows = db.prepare(`
       SELECT id, artist, title, album, genre, duration_sec, ytdl_id, features_json
       FROM external_catalog
       WHERE ${conditions.join(" AND ")}
-      LIMIT 400
+      LIMIT 200
     `).all() as RowType[];
   }
 
   const scored: { track: RowType; features: AcousticFeatures12D; dist: number }[] = [];
   const speechRegex = new RegExp(config.nonMusicKeywords.join("|"), "i");
+  const seenInBatch = new Set<string>();
 
   for (const row of rows) {
     if (row.duration_sec && (row.duration_sec > config.maxTrackDurationSec || row.duration_sec < config.minTrackDurationSec)) continue;
     const fullText = `${row.genre || ""} ${row.artist} ${row.title}`;
     if (speechRegex.test(fullText)) continue;
+    if (folkEthnicRegex.test(fullText)) continue; // Filter out regional folk / corridos
 
     const key = `${row.artist} - ${row.title}`.toLowerCase();
-    if (excludeTitles.has(key)) continue;
+    if (excludeTitles.has(key) || seenInBatch.has(key)) continue;
+    seenInBatch.add(key);
 
     let f: AcousticFeatures12D;
     try {
@@ -225,7 +242,11 @@ export function find12DCandidates(
     if (!f) continue;
     if (f.speechiness && f.speechiness > config.maxSpeechiness) continue;
 
-    const dist = compute12DDistance(effectiveSeed, f);
+    let dist = compute12DDistance(effectiveSeed, f);
+    // Slight priority bonus for verified clean genres over unlabelled General
+    if (row.genre === "General" || !row.genre) {
+      dist *= 1.12;
+    }
     scored.push({ track: row, features: f, dist });
   }
 

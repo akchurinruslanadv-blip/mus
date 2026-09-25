@@ -523,20 +523,21 @@ export function findTrackByArtistTitle(
   artist: string,
   title: string,
   db = getDb()
-): { id: number; path: string; hasEmbedding: boolean } | null {
+): { id: number; path: string; hasEmbedding: boolean; isActive?: boolean } | null {
   const row = db.prepare(`
-    SELECT t.id, t.path, CASE WHEN f.embedding IS NOT NULL THEN 1 ELSE 0 END AS has_embedding
+    SELECT t.id, t.path, t.is_active, CASE WHEN f.embedding IS NOT NULL THEN 1 ELSE 0 END AS has_embedding
     FROM tracks t
     LEFT JOIN features f ON f.track_id = t.id
     WHERE LOWER(t.artist) = LOWER(?) AND LOWER(t.title) = LOWER(?)
     LIMIT 1
-  `).get(artist, title) as { id: number; path: string; has_embedding: number } | undefined;
+  `).get(artist, title) as { id: number; path: string; is_active: number; has_embedding: number } | undefined;
 
   if (!row) return null;
   return {
     id: row.id,
     path: row.path,
-    hasEmbedding: row.has_embedding === 1
+    hasEmbedding: row.has_embedding === 1,
+    isActive: row.is_active === 1
   };
 }
 

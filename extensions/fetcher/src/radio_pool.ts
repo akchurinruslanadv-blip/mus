@@ -115,6 +115,20 @@ export class RadioPoolManager {
       }
     }
 
+    // Add inactive or familiar tracks to excludeSet so find12DCandidates skips them
+    try {
+      const inactiveOrFamiliar = db.prepare(`
+        SELECT LOWER(t.artist) as artist, LOWER(t.title) as title
+        FROM tracks t
+        WHERE t.is_active = 0
+           OR t.id IN (SELECT track_id FROM listening_history)
+           OR t.id IN (SELECT track_id FROM favorites)
+      `).all() as { artist: string; title: string }[];
+      for (const r of inactiveOrFamiliar) {
+        excludeSet.add(`${r.artist} - ${r.title}`);
+      }
+    } catch {}
+
     // Read active biases if not passed
     const activeBiases = biases || (session?.id ? getRadioSettings(session.id, db).biases : undefined);
 
@@ -142,8 +156,8 @@ export class RadioPoolManager {
       if (this.pool.length >= this.targetPoolSize) break;
 
       const existing = findTrackByArtistTitle(hit.artist, hit.title, db);
-      // Skip tracks already familiar to user in listening_history or favorites
-      if (existing && isTrackFamiliar(existing.id, db)) {
+      // Skip tracks already familiar or inactive (e.g. previously evicted discordant tracks)
+      if (existing && (!existing.isActive || isTrackFamiliar(existing.id, db))) {
         continue;
       }
       const isAlreadyEmbedded = existing ? existing.hasEmbedding : false;
@@ -226,8 +240,39 @@ export class RadioPoolManager {
               const score512 = score512AgainstCentroid(f32, centroid);
               candidate.score = Math.round(score512 * 100) / 100;
               candidate.explanation = `🧠 512D Отбор (${Math.round(score512 * 100)}% вкус)`;
+
+              // Smart eviction of discordant tracks:
+              // If candidate is hellishly far from user taste (score < 0.40):
+              // Delete the downloaded audio file to save disk space,
+              // but KEEP track info, ytdl_id, and 512D vector in SQLite so we remember it.
+              if (score512 < 0.40) {
+                console.log(`[radio-pool] Discordant candidate (512D score: ${candidate.score} < 0.40): ${candidate.artist} - ${candidate.title}. Evicting audio file, preserving 512D embedding in DB.`);
+                if (candidate.filePath) {
+                  try {
+                    await Deno.remove(candidate.filePath);
+                  } catch (remErr) {
+                    console.warn(`[radio-pool] Failed to remove evicted audio file:`, remErr);
+                  }
+                }
+                try {
+                  db.prepare(`UPDATE tracks SET path = '', is_active = 0 WHERE id = ?`).run(candidate.trackId);
+                  db.prepare(`
+                    INSERT INTO listening_history (track_id, ts, source, action, reason)
+                    VALUES (?, ?, 'radio_pool', 'discard', 'discordant_512')
+                  `).run(candidate.trackId, new Date().toISOString());
+                } catch (dbErr) {
+                  console.warn(`[radio-pool] Failed to update DB on eviction:`, dbErr);
+                }
+
+                // Remove from pool and trigger replenishment
+                this.pool = this.pool.filter(c => c !== candidate);
+                setTimeout(() => this.maintainPool().catch(() => {}), 500);
+                return;
+              }
             }
-          } catch {}
+          } catch (scoringErr) {
+            console.warn(`[radio-pool] Error during 512D centroid scoring:`, scoringErr);
+          }
         }
       }
 
