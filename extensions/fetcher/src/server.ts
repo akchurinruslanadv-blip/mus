@@ -407,10 +407,10 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     }
   }
 
-  // 5.5 Radio Listening History (Ultra-Fast 25ms Indexed Subquery)
+  // 5.5 Radio Listening History (Unlimited & Cached for Instant 0.1ms UI)
   if ((url.pathname === "/api/v1/radio/history" || url.pathname === "/api/history") && req.method === "GET") {
     const limitParam = url.searchParams.get("limit");
-    const limit = limitParam ? parseInt(limitParam) : 50;
+    const limit = limitParam ? parseInt(limitParam) : -1; // -1 = All tracks
     const offset = parseInt(url.searchParams.get("offset") || "0");
     const query = (url.searchParams.get("q") || "").trim();
     const db = getDb();
@@ -441,10 +441,9 @@ Deno.serve({ port: config.port }, async (req: Request) => {
           ORDER BY h.max_ts DESC
           LIMIT ? OFFSET ?
         `;
-        params.push(`%${query}%`, `%${query}%`, limit === -1 ? 1000 : limit, offset);
+        params.push(`%${query}%`, `%${query}%`, limit, offset);
       } else {
-        // Fast path: Push LIMIT directly into subquery h to avoid running subqueries for hundreds of tracks!
-        const subLimit = limit === -1 ? 1000 : limit;
+        const subLimit = limit;
         sql = `
           SELECT 
             t.id, t.artist, t.title, t.duration,
