@@ -64,6 +64,9 @@ console.log(`=======================================================`);
 // Session recent tracks tracking to avoid repetitive recommendations
 const sessionRecentMap = new Map<string, number[]>();
 
+// Currently active on-demand audio downloads for UI progress display
+const activeStreamDownloads = new Map<number, { startedAt: number; query: string }>();
+
 // In-memory cache for GET /api/favorites (avoids 700ms 550KB SQLite serialization on every like/load)
 let cachedFavoritesResponse: string | null = null;
 let lastFavoritesCacheTime = 0;
@@ -384,6 +387,28 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     const trackId = parseInt(resolveMatch[1]);
     const res = await resolveTrackAudio(trackId);
     return new Response(JSON.stringify(res), { status: res.ready ? 200 : 404, headers });
+  }
+
+  // 4.1 Track Download & Buffering Status (Display loading progress in UI)
+  const statusMatch = url.pathname.match(/^\/api\/v1\/tracks\/(\d+)\/status$/);
+  if (statusMatch && req.method === "GET") {
+    const trackId = parseInt(statusMatch[1], 10);
+    const db = getDb();
+    const tRow = db.prepare(`SELECT path, title, artist, file_size FROM tracks WHERE id = ?`).get(trackId) as any;
+    let onDisk = false;
+    if (tRow?.path) {
+      try { onDisk = Deno.statSync(tRow.path).isFile; } catch {}
+    }
+    const isDownloading = activeStreamDownloads.has(trackId);
+    const dlInfo = activeStreamDownloads.get(trackId);
+    return new Response(JSON.stringify({
+      track_id: trackId,
+      on_disk: onDisk,
+      is_downloading: isDownloading,
+      elapsed_ms: dlInfo ? Date.now() - dlInfo.startedAt : 0,
+      title: tRow?.title || "",
+      artist: tRow?.artist || ""
+    }), { headers });
   }
 
   // 5. Pin Track (💾 Сохранить навсегда)
@@ -1131,7 +1156,13 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         // 4. On-demand resolving (Cold search / download)
         console.log(`[stream-proxy] Audio missing on disk for Track ${trackId} ("${track.artist} - ${track.title}"). On-demand resolving (ytdl: ${preferredYtdlId || "searching"})...`);
         const query = `${track.artist} - ${track.title}`.trim();
-        const fetchRes = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
+        activeStreamDownloads.set(trackId, { startedAt: Date.now(), query });
+        let fetchRes;
+        try {
+          fetchRes = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
+        } finally {
+          activeStreamDownloads.delete(trackId);
+        }
         if (fetchRes.success && fetchRes.filePath) {
           track.path = fetchRes.filePath;
           try {

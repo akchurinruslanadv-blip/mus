@@ -780,38 +780,74 @@ export function searchExternalCatalog(
 
   let rows: CatRow[] = [];
 
+  function buildCasedPatterns(text: string): string[] {
+    const set = new Set<string>();
+    const raw = text.trim();
+    if (!raw) return [];
+    set.add(raw);
+    set.add(raw.toLowerCase());
+    set.add(raw.toUpperCase());
+    const titleCased = raw.replace(/(?:^|\s)\S/g, a => a.toUpperCase());
+    set.add(titleCased);
+    const firstUpper = raw.charAt(0).toUpperCase() + raw.slice(1);
+    set.add(firstUpper);
+    return Array.from(set);
+  }
+
   // Check if query is formatted as "Artist - Title"
   if (q.includes(" - ")) {
     const parts = q.split(" - ");
-    const artistPrefix = parts[0].trim() + "%";
-    const titlePrefix = parts.slice(1).join(" - ").trim() + "%";
+    const artistPatterns = buildCasedPatterns(parts[0]);
+    const titlePatterns = buildCasedPatterns(parts.slice(1).join(" - "));
+    const conds: string[] = [];
+    const params: any[] = [];
+    for (const a of artistPatterns) {
+      for (const t of titlePatterns) {
+        conds.push("(artist LIKE ? AND title LIKE ?)");
+        params.push(a + "%", t + "%");
+      }
+    }
+    params.push(limit, offset);
     rows = db.prepare(`
       SELECT id, artist, title, album, genre, duration_sec, features_json
       FROM external_catalog
-      WHERE artist LIKE ? AND title LIKE ? AND is_available = 1
+      WHERE (${conds.join(" OR ")}) AND is_available = 1
       LIMIT ? OFFSET ?
-    `).all(artistPrefix, titlePrefix, limit, offset) as CatRow[];
+    `).all(...params) as CatRow[];
   } else {
-    // 1. Instant prefix match on artist or title (hits idx_ext_cat_artist_nocase & idx_ext_cat_title_nocase)
-    const prefix = q + "%";
+    // 1. Instant multi-cased prefix match on artist or title (hits idx_ext_cat_artist_nocase & idx_ext_cat_title_nocase)
+    const patterns = buildCasedPatterns(q);
+    const conds: string[] = [];
+    const params: any[] = [];
+    for (const p of patterns) {
+      conds.push("(artist LIKE ? OR title LIKE ?)");
+      params.push(p + "%", p + "%");
+    }
+    params.push(limit, offset);
     rows = db.prepare(`
       SELECT id, artist, title, album, genre, duration_sec, features_json
       FROM external_catalog
-      WHERE (artist LIKE ? OR title LIKE ?) AND is_available = 1
+      WHERE (${conds.join(" OR ")}) AND is_available = 1
       LIMIT ? OFFSET ?
-    `).all(prefix, prefix, limit, offset) as CatRow[];
+    `).all(...params) as CatRow[];
 
     // 2. If fewer results than desired and query length >= 3, supplement with word boundary match '% q%'
     if (rows.length < limit && q.length >= 3 && offset === 0) {
       const existingIds = new Set(rows.map(r => r.id));
-      const wordMatch = "% " + q + "%";
+      const wordConds: string[] = [];
+      const wordParams: any[] = [];
+      for (const p of patterns) {
+        wordConds.push("(artist LIKE ? OR title LIKE ?)");
+        wordParams.push("% " + p + "%", "% " + p + "%");
+      }
       const remainingLimit = limit - rows.length;
+      wordParams.push(remainingLimit);
       const extraRows = db.prepare(`
         SELECT id, artist, title, album, genre, duration_sec, features_json
         FROM external_catalog
-        WHERE (artist LIKE ? OR title LIKE ?) AND is_available = 1
+        WHERE (${wordConds.join(" OR ")}) AND is_available = 1
         LIMIT ?
-      `).all(wordMatch, wordMatch, remainingLimit) as CatRow[];
+      `).all(...wordParams) as CatRow[];
 
       for (const r of extraRows) {
         if (!existingIds.has(r.id)) {

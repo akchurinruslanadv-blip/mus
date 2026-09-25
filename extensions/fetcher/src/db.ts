@@ -13,6 +13,8 @@ export function getDb(): Database {
       _db.exec("PRAGMA synchronous = NORMAL;");
       _db.exec("PRAGMA cache_size = -64000;");
       _db.exec("PRAGMA busy_timeout = 5000;");
+      // Register Unicode lower function for Russian / non-ASCII case-insensitive matching
+      _db.function("lower", (s: unknown) => typeof s === "string" ? s.toLowerCase() : s);
     } catch {}
     initSchema(_db);
   }

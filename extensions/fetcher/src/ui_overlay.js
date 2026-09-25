@@ -1011,7 +1011,376 @@
     } catch {}
   }
 
+  // 3.6 Live Loading Status Indicator (Загрузка на сервер & Буферизация на устройство)
+  let loadingPollTimer = null;
+
+  function injectLoadingIndicator() {
+    const metaContainer = document.querySelector(".now-stage .now-meta");
+    if (!metaContainer) return;
+
+    let loadEl = document.getElementById("addon-loading-indicator");
+    if (!loadEl) {
+      loadEl = document.createElement("div");
+      loadEl.id = "addon-loading-indicator";
+      loadEl.style.cssText = "display:none; align-items:center; gap:8px; margin:4px 0 10px 0; padding:5px 12px; border-radius:10px; font-size:0.78rem; font-weight:600; background:rgba(0,0,0,0.35); border:1px solid rgba(255,255,255,0.12); color:#f7f0e8; width:fit-content; transition:all 0.25s;";
+      loadEl.innerHTML = `
+        <span id="addon-load-spinner" style="display:inline-block; font-size:0.85rem;">⏳</span>
+        <span id="addon-load-text">Загрузка на сервер...</span>
+        <div id="addon-load-progress-wrap" style="display:none; width:70px; height:5px; background:rgba(255,255,255,0.18); border-radius:3px; overflow:hidden;">
+          <div id="addon-load-progress-bar" style="width:0%; height:100%; background:#e07a3a; transition:width 0.2s;"></div>
+        </div>
+        <span id="addon-load-sub" style="font-size:0.72rem; color:var(--muted,#a89f91);"></span>
+      `;
+      const badgeEl = document.getElementById("addon-now-playing-origin");
+      if (badgeEl && badgeEl.nextSibling) {
+        metaContainer.insertBefore(loadEl, badgeEl.nextSibling);
+      } else {
+        const progWrap = metaContainer.querySelector(".progress-wrap");
+        if (progWrap) metaContainer.insertBefore(loadEl, progWrap);
+        else metaContainer.appendChild(loadEl);
+      }
+    }
+  }
+
+  function setLoadingStatus(stage, text, sub = "", pct = null) {
+    injectLoadingIndicator();
+    const loadEl = document.getElementById("addon-loading-indicator");
+    const sp = document.getElementById("addon-load-spinner");
+    const txt = document.getElementById("addon-load-text");
+    const barWrap = document.getElementById("addon-load-progress-wrap");
+    const bar = document.getElementById("addon-load-progress-bar");
+    const subEl = document.getElementById("addon-load-sub");
+    if (!loadEl || !txt) return;
+
+    if (stage === "hidden") {
+      loadEl.style.display = "none";
+      return;
+    }
+
+    loadEl.style.display = "inline-flex";
+
+    if (stage === "server") {
+      loadEl.style.borderColor = "rgba(234,179,8,0.4)";
+      loadEl.style.background = "rgba(234,179,8,0.15)";
+      if (sp) { sp.textContent = "⏳"; sp.style.animation = "spin 1.5s linear infinite"; }
+      txt.textContent = text || "Загрузка на сервер (yt-dlp)...";
+      txt.style.color = "#fbbf24";
+      if (barWrap) barWrap.style.display = "none";
+      if (subEl) subEl.textContent = sub || "";
+    } else if (stage === "device") {
+      loadEl.style.borderColor = "rgba(56,189,248,0.4)";
+      loadEl.style.background = "rgba(56,189,248,0.15)";
+      if (sp) { sp.textContent = "⚡"; sp.style.animation = ""; }
+      txt.textContent = text || "Буферизация на устройство...";
+      txt.style.color = "#38bdf8";
+      if (barWrap) {
+        barWrap.style.display = "block";
+        if (bar && pct !== null) bar.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+      }
+      if (subEl) subEl.textContent = pct !== null ? `${pct}%` : sub;
+    } else if (stage === "ready") {
+      loadEl.style.borderColor = "rgba(34,197,94,0.4)";
+      loadEl.style.background = "rgba(34,197,94,0.15)";
+      if (sp) { sp.textContent = "✓"; sp.style.animation = ""; }
+      txt.textContent = text || "Готово к воспроизведению";
+      txt.style.color = "#4ade80";
+      if (barWrap) barWrap.style.display = "none";
+      if (subEl) subEl.textContent = "";
+      setTimeout(() => {
+        if (loadEl.dataset.stage === "ready") loadEl.style.display = "none";
+      }, 1800);
+    } else if (stage === "error") {
+      loadEl.style.borderColor = "rgba(248,113,113,0.4)";
+      loadEl.style.background = "rgba(248,113,113,0.15)";
+      if (sp) { sp.textContent = "✕"; sp.style.animation = ""; }
+      txt.textContent = text || "Ошибка загрузки";
+      txt.style.color = "#f87171";
+      if (barWrap) barWrap.style.display = "none";
+      if (subEl) subEl.textContent = sub;
+    }
+    loadEl.dataset.stage = stage;
+  }
+
+  function wireAudioLoadingEvents() {
+    const audioEl = document.getElementById("audio");
+    if (!audioEl || audioEl._loadingWired) return;
+    audioEl._loadingWired = true;
+
+    audioEl.addEventListener("loadstart", async () => {
+      const src = audioEl.src || "";
+      const m = src.match(/\/api\/stream\/(\d+)/);
+      const trackId = m ? parseInt(m[1], 10) : null;
+      if (!trackId) return;
+
+      clearInterval(loadingPollTimer);
+      try {
+        const sRes = await fetch(`${API_BASE}/api/v1/tracks/${trackId}/status`);
+        const sData = await sRes.json();
+        if (!sData.on_disk) {
+          setLoadingStatus("server", "Загрузка на сервер (yt-dlp)...", "скачивание");
+          loadingPollTimer = setInterval(async () => {
+            try {
+              const r = await fetch(`${API_BASE}/api/v1/tracks/${trackId}/status`);
+              const d = await r.json();
+              if (d.on_disk) {
+                clearInterval(loadingPollTimer);
+                setLoadingStatus("device", "Буферизация на устройство...");
+              } else {
+                const sec = Math.round((d.elapsed_ms || 0) / 1000);
+                setLoadingStatus("server", "Загрузка на сервер (yt-dlp)...", `${sec} сек`);
+              }
+            } catch {}
+          }, 800);
+          return;
+        }
+      } catch {}
+
+      setLoadingStatus("device", "Буферизация на устройство...");
+    });
+
+    audioEl.addEventListener("progress", () => {
+      clearInterval(loadingPollTimer);
+      if (audioEl.buffered.length > 0 && Number.isFinite(audioEl.duration) && audioEl.duration > 0) {
+        const pct = Math.round((audioEl.buffered.end(audioEl.buffered.length - 1) / audioEl.duration) * 100);
+        if (pct < 98) {
+          setLoadingStatus("device", "Буферизация на устройство...", `${pct}%`, pct);
+        } else {
+          setLoadingStatus("ready", "Готово, воспроизведение");
+        }
+      }
+    });
+
+    audioEl.addEventListener("waiting", () => {
+      setLoadingStatus("device", "Подгрузка аудио-буфера...");
+    });
+
+    audioEl.addEventListener("canplay", () => {
+      clearInterval(loadingPollTimer);
+      setLoadingStatus("ready", "Готово, воспроизведение");
+    });
+
+    audioEl.addEventListener("playing", () => {
+      clearInterval(loadingPollTimer);
+      setLoadingStatus("ready", "Воспроизведение");
+    });
+
+    audioEl.addEventListener("error", () => {
+      clearInterval(loadingPollTimer);
+      setLoadingStatus("error", "Ошибка аудиопотока", "попробуйте следующий трек");
+    });
+  }
+
+  // 3.7 Previous Track Navigation in Radio & Queue
+  const playedHistoryStack = [];
+  let currentHistoryTrackId = null;
+
+  function pushPlayedTrack(track) {
+    if (!track || !track.id) return;
+    if (currentHistoryTrackId === track.id) return;
+    if (currentHistoryTrackId !== null) {
+      const curObj = typeof window.currentTrack === "function" ? window.currentTrack() : null;
+      playedHistoryStack.push({
+        id: currentHistoryTrackId,
+        title: curObj?.title || "",
+        artist: curObj?.artist || ""
+      });
+      if (playedHistoryStack.length > 50) playedHistoryStack.shift();
+    }
+    currentHistoryTrackId = track.id;
+  }
+
+  function injectPrevButton() {
+    const transport = document.querySelector(".now-stage .transport");
+    if (!transport) return;
+    let prevBtn = document.getElementById("btn-prev");
+    if (!prevBtn) {
+      prevBtn = document.createElement("button");
+      prevBtn.type = "button";
+      prevBtn.className = "icon-btn";
+      prevBtn.id = "btn-prev";
+      prevBtn.title = "Предыдущий трек (кнопка B / Назад)";
+      prevBtn.innerHTML = "⏮";
+      prevBtn.style.fontSize = "1.2rem";
+
+      const playBtn = document.getElementById("btn-play");
+      if (playBtn) {
+        transport.insertBefore(prevBtn, playBtn);
+      } else {
+        transport.appendChild(prevBtn);
+      }
+
+      prevBtn.onclick = async () => {
+        const audio = document.getElementById("audio");
+        if (audio && audio.currentTime > 3) {
+          audio.currentTime = 0;
+          audio.play().catch(() => {});
+          toast("⏮ С начала трека");
+          return;
+        }
+
+        if (playedHistoryStack.length > 0) {
+          const prev = playedHistoryStack.pop();
+          toast(`⏮ ${prev.artist ? prev.artist + " — " : ""}${prev.title || "Предыдущий трек"}`);
+          if (typeof window.playFixed === "function") {
+            await window.playFixed({ track_id: prev.id, name: prev.title });
+          } else {
+            const res = await fetch(`${API_BASE}/api/play`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ track_id: prev.id, name: prev.title })
+            });
+            const data = await res.json();
+            if (typeof window.applyPlayPayload === "function") window.applyPlayPayload(data);
+          }
+        } else {
+          toast("Это первый трек в текущей истории");
+          if (audio) {
+            audio.currentTime = 0;
+            audio.play().catch(() => {});
+          }
+        }
+      };
+    }
+  }
+
+  // 3.8 Instant Russian Catalog Search in Library View
+  function hookLibrarySearch() {
+    const libFilter = document.getElementById("lib-filter");
+    const viewLib = document.getElementById("view-library");
+    if (!libFilter || !viewLib || libFilter._catalogHooked) return;
+    libFilter._catalogHooked = true;
+
+    let catSearchTimer = null;
+    let catalogBox = document.getElementById("addon-lib-catalog-box");
+    if (!catalogBox) {
+      catalogBox = document.createElement("div");
+      catalogBox.id = "addon-lib-catalog-box";
+      catalogBox.style.cssText = "display:none; margin-top:14px; padding:12px; border-radius:12px; background:rgba(0,0,0,0.3); border:1px solid rgba(234,179,8,0.25);";
+      
+      const libList = document.getElementById("lib-list");
+      if (libList && libList.nextSibling) {
+        viewLib.insertBefore(catalogBox, libList.nextSibling);
+      } else {
+        viewLib.appendChild(catalogBox);
+      }
+    }
+
+    libFilter.addEventListener("input", (e) => {
+      const q = (e.target.value || "").trim();
+      clearTimeout(catSearchTimer);
+      if (q.length < 2) {
+        catalogBox.style.display = "none";
+        return;
+      }
+
+      catSearchTimer = setTimeout(async () => {
+        try {
+          const res = await fetch(`${API_BASE}/api/v1/catalog/search?q=${encodeURIComponent(q)}&limit=10`);
+          const data = await res.json();
+          const tracks = data.tracks || [];
+
+          catalogBox.style.display = "block";
+          catalogBox.innerHTML = `
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+              <span style="font-size:0.80rem; font-weight:700; color:#fbbf24;">🌍 Найдено в каталоге (3.27 млн треков):</span>
+              <button type="button" id="addon-btn-lib-online" class="btn quiet sm" style="padding:2px 8px; font-size:0.72rem; border-radius:8px; background:rgba(56,189,248,0.18); color:#38bdf8; border:1px solid rgba(56,189,248,0.4); cursor:pointer;">
+                🌐 Искать в Google Music
+              </button>
+            </div>
+            <ul style="list-style:none; padding:0; margin:0;">
+              ${tracks.length > 0 ? tracks.map(t => `
+                <li style="display:flex; justify-content:space-between; align-items:center; padding:6px 8px; border-radius:6px; margin-bottom:3px; background:rgba(255,255,255,0.03); border-bottom:1px solid rgba(255,255,255,0.04);">
+                  <div style="cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" class="addon-lib-cat-play" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-track-id="${t.track_id || ''}">
+                    <span style="color:#e07a3a; margin-right:4px;">▶</span>
+                    <strong>${escapeHtml(t.artist)}</strong> — ${escapeHtml(t.title)}
+                  </div>
+                  <span style="font-size:0.72rem; color:var(--muted,#a89f91); margin-left:8px;">${fmtTime(t.duration_sec || 180)}</span>
+                </li>
+              `).join("") : `<li style="padding:6px; color:var(--muted,#a89f91); font-size:0.78rem;">В локальной базе 3.27M не найдено. Нажмите «🌐 Искать в Google Music».</li>`}
+            </ul>
+          `;
+
+          const onlineBtn = catalogBox.querySelector("#addon-btn-lib-online");
+          if (onlineBtn) {
+            onlineBtn.onclick = async () => {
+              onlineBtn.textContent = "⏳ Поиск...";
+              try {
+                const oRes = await fetch(`${API_BASE}/api/v1/catalog/search-online?q=${encodeURIComponent(q)}&limit=8`);
+                const oData = await oRes.json();
+                const oTracks = oData.tracks || [];
+                onlineBtn.textContent = `Google: ${oTracks.length}`;
+                if (oTracks.length > 0) {
+                  const ul = catalogBox.querySelector("ul");
+                  if (ul) {
+                    ul.innerHTML = oTracks.map(t => `
+                      <li style="display:flex; justify-content:space-between; align-items:center; padding:6px 8px; border-radius:6px; margin-bottom:3px; background:rgba(56,189,248,0.06); border-bottom:1px solid rgba(56,189,248,0.15);">
+                        <div style="cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;" class="addon-lib-cat-play" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-track-id="${t.track_id || ''}">
+                          <span style="color:#38bdf8; margin-right:4px;">▶</span>
+                          <strong>${escapeHtml(t.artist)}</strong> — ${escapeHtml(t.title)}
+                        </div>
+                        <span style="font-size:0.72rem; color:#38bdf8;">🌐 Онлайн</span>
+                      </li>
+                    `).join("");
+                    attachLibCatClicks();
+                  }
+                }
+              } catch (e) {
+                onlineBtn.textContent = "Ошибка";
+              }
+            };
+          }
+
+          attachLibCatClicks();
+        } catch {}
+      }, 250);
+    });
+
+    function attachLibCatClicks() {
+      catalogBox.querySelectorAll(".addon-lib-cat-play").forEach(el => {
+        el.onclick = async () => {
+          const a = el.dataset.artist;
+          const t = el.dataset.title;
+          const tid = el.dataset.trackId ? parseInt(el.dataset.trackId, 10) : null;
+          toast(`▶ Запуск: ${a} — ${t}`);
+          if (tid && typeof window.playFixed === "function") {
+            await window.playFixed({ track_id: tid, name: t });
+          } else {
+            const fRes = await fetch(`${API_BASE}/api/v1/fetch`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ artist: a, title: t, query: `${a} - ${t}` })
+            });
+            const fData = await fRes.json();
+            if (fData.success && fData.trackId && typeof window.playFixed === "function") {
+              await window.playFixed({ track_id: fData.trackId, name: t });
+            }
+          }
+        };
+      });
+    }
+  }
+
+  // 3.9 Clickable Queue Items & Playlist Suppression
+  function hookQueueInteractions() {
+    const qEl = document.getElementById("queue");
+    if (!qEl) return;
+    qEl.querySelectorAll("li").forEach(li => {
+      if (li._clickWired) return;
+      li._clickWired = true;
+      li.style.cursor = "pointer";
+      li.title = "Нажмите, чтобы включить этот трек";
+      li.addEventListener("click", async (e) => {
+        if (e.target.closest("button") || e.target.closest(".tag")) return;
+        const trackId = li.dataset.trackId ? parseInt(li.dataset.trackId, 10) : null;
+        if (trackId && typeof window.playFixed === "function") {
+          await window.playFixed({ track_id: trackId });
+        }
+      });
+    });
+  }
+
   async function updateQueueOrigins() {
+    hookQueueInteractions();
     const playlistEl = document.getElementById("playlist");
     const queueEl = document.getElementById("queue");
     const items = [];
@@ -1248,6 +1617,7 @@
         orig.apply(this, arguments);
         try {
           if (track && track.id) {
+            pushPlayedTrack(track);
             setTimeout(() => updateNowPlayingOrigin(track.id), 50);
           }
         } catch {}
@@ -1615,6 +1985,15 @@
         .addon-btn-hist-fav:hover { transform: scale(1.22); }
         .addon-btn-hist-pin:hover { transform: scale(1.22); }
         .addon-src-badge { white-space: nowrap; line-height: 1.2; vertical-align: middle; }
+        #playlist { display: none !important; }
+        #playlist-label { display: none !important; }
+        #queue { display: block !important; }
+        #queue li { cursor: pointer !important; transition: background 0.15s, transform 0.1s; }
+        #queue li:hover { background: rgba(255,255,255,0.08) !important; border-radius: 6px; }
+        #queue li:active { transform: scale(0.99); }
+        #btn-prev { background: transparent; border: none; cursor: pointer; color: var(--fg, #f7f0e8); transition: transform 0.15s, color 0.15s; }
+        #btn-prev:hover { transform: scale(1.2); color: var(--accent, #e07a3a); }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
       `;
       document.head.appendChild(st);
     }
@@ -2034,6 +2413,11 @@
     injectUploadSection();
     injectRadioHistory();
     injectRadioSliders();
+    injectLoadingIndicator();
+    wireAudioLoadingEvents();
+    injectPrevButton();
+    hookLibrarySearch();
+    hookQueueInteractions();
 
     // Keep active tab state consistent
     if (activeQueueTab === "history") {
@@ -2055,6 +2439,16 @@
     preloadNextTrackFromQueue();
     hookSkipDebounce();
   }, 2000);
+
+  // Keyboard shortcut: B key for Previous Track
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target && e.target.tagName) || "";
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
+    if (e.code === "KeyB" || e.key === "b" || e.key === "B" || e.key === "MediaTrackPrevious") {
+      e.preventDefault();
+      document.getElementById("btn-prev")?.click();
+    }
+  });
 
   // 2. Slow background telemetry refresh (every 30 seconds, zero SQLite locking)
   setInterval(() => {
@@ -2128,6 +2522,11 @@
     injectUploadSection();
     injectRadioHistory();
     injectRadioSliders();
+    injectLoadingIndicator();
+    wireAudioLoadingEvents();
+    injectPrevButton();
+    hookLibrarySearch();
+    hookQueueInteractions();
     updateCacheStats();
     updateNowPlayingOrigin();
     updateQueueOrigins();
