@@ -696,11 +696,24 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       let trackId: number;
 
       // 1. Check if track already exists in tracks table
-      const existing = db.prepare(`
-        SELECT id, path FROM tracks 
-        WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
-        LIMIT 1
-      `).get(artist, title) as { id: number; path: string } | undefined;
+      let existing: { id: number; path: string } | undefined;
+      if (body.track_id) {
+        existing = db.prepare(`SELECT id, path FROM tracks WHERE id = ?`).get(body.track_id) as { id: number; path: string } | undefined;
+      }
+      if (!existing) {
+        existing = db.prepare(`
+          SELECT id, path FROM tracks 
+          WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE
+          LIMIT 1
+        `).get(artist, title) as { id: number; path: string } | undefined;
+      }
+      if (!existing) {
+        existing = db.prepare(`
+          SELECT id, path FROM tracks 
+          WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+          LIMIT 1
+        `).get(artist, title) as { id: number; path: string } | undefined;
+      }
 
       if (existing) {
         trackId = existing.id;
@@ -985,6 +998,17 @@ Deno.serve({ port: config.port }, async (req: Request) => {
 
       if (track) {
         let fileExists = track.path ? await Deno.stat(track.path).then(s => s.isFile).catch(() => false) : false;
+        if (!fileExists) {
+          const alternate = db.prepare(`
+            SELECT id, path, ytdl_id FROM tracks 
+            WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE AND id != ?
+          `).get(track.artist, track.title, trackId) as { id: number; path: string; ytdl_id?: string } | undefined;
+          if (alternate?.path && await Deno.stat(alternate.path).then(s => s.isFile).catch(() => false)) {
+            track.path = alternate.path;
+            if (alternate.ytdl_id) track.ytdl_id = alternate.ytdl_id;
+            fileExists = true;
+          }
+        }
 
         // 1. FAST PATH: If audio file exists on disk, serve immediately in 1-2ms!
         if (fileExists) {
@@ -1280,6 +1304,19 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
       newHeaders.set("Pragma", "no-cache");
       return new Response(html, {
+        status: upstreamRes.status,
+        headers: newHeaders
+      });
+    }
+
+    if (url.pathname === "/app.js" || url.pathname.endsWith("/app.js")) {
+      let js = await upstreamRes.text();
+      js += `\n\n// Expose core player functions for addons\nif (typeof window !== "undefined") {\n  try { window.playFixed = playFixed; } catch {}\n  try { window.applyPlayPayload = applyPlayPayload; } catch {}\n  try { window.setView = setView; } catch {}\n  try { window.renderQueue = renderQueue; } catch {}\n  try { window.currentTrack = () => current; } catch {}\n}\n`;
+      const newHeaders = new Headers(upstreamRes.headers);
+      newHeaders.delete("content-length");
+      newHeaders.set("Cache-Control", "no-cache, no-store, must-revalidate");
+      newHeaders.set("Pragma", "no-cache");
+      return new Response(js, {
         status: upstreamRes.status,
         headers: newHeaders
       });

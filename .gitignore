@@ -22,6 +22,8 @@ data/db/*.db-shm
 *.db
 *.sqlite
 *.sqlite3
+cookies.txt
+*.cookies
 
 # 3. Local Binaries & Compiled Executables
 bin/

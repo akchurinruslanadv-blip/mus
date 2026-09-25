@@ -1322,6 +1322,11 @@
 
   async function playHistoryTrack(trackId, title) {
     try {
+      if (typeof window.playFixed === "function") {
+        await window.playFixed({ track_id: trackId, name: title || "" });
+        setTimeout(loadRadioHistory, 600);
+        return;
+      }
       toast(`▶ Воспроизведение: ${title || "#" + trackId}`);
       const res = await fetch(`${API_BASE}/api/play`, {
         method: "POST",
@@ -1331,6 +1336,7 @@
       const data = await res.json();
       if (typeof window.applyPlayPayload === "function") {
         window.applyPlayPayload(data);
+        if (typeof window.setView === "function") window.setView("player");
       } else {
         const audio = document.getElementById("audio");
         if (audio) {
@@ -1742,7 +1748,7 @@
         let localBadge = t.is_local ? `<span style="background:rgba(34,197,94,0.15); color:#22c55e; border:1px solid rgba(34,197,94,0.3); padding:1px 5px; border-radius:5px; font-size:0.68rem; font-weight:600;" title="Трек уже в локальной коллекции">💿 В коллекции</span>` : "";
 
         return `
-          <li class="addon-catalog-item" data-id="${t.id}" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-album="${escapeHtml(t.album)}" data-duration="${t.duration_sec}" style="display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; margin-bottom:3px; cursor:pointer; transition:background 0.15s; background:rgba(255,255,255,0.02); border-bottom:1px solid rgba(255,255,255,0.04);">
+          <li class="addon-catalog-item" data-id="${t.id}" data-track-id="${t.track_id || ''}" data-artist="${escapeHtml(t.artist)}" data-title="${escapeHtml(t.title)}" data-album="${escapeHtml(t.album)}" data-duration="${t.duration_sec}" style="display:flex; align-items:center; gap:8px; padding:7px 10px; border-radius:8px; margin-bottom:3px; cursor:pointer; transition:background 0.15s; background:rgba(255,255,255,0.02); border-bottom:1px solid rgba(255,255,255,0.04);">
             <div class="addon-play-icon" style="color:var(--muted,#a89f91); font-size:0.88rem; width:18px; text-align:center; flex-shrink:0; transition:transform 0.15s, color 0.15s;" title="Слушать сейчас">
               ▶
             </div>
@@ -1772,19 +1778,34 @@
         const album = itemEl.dataset.album || "";
         const duration_sec = parseInt(itemEl.dataset.duration || "180", 10);
         const id = parseInt(itemEl.dataset.id || "0", 10);
+        const trackId = parseInt(itemEl.dataset.trackId || "0", 10);
 
         itemEl.onclick = async (e) => {
           if (e.target.closest(".addon-cat-actions")) return;
           try {
-            toast(`⚡ Запуск из базы 3.2M: ${artist} - ${title}...`);
+            if (trackId > 0) {
+              toast(`▶ В коллекции: ${artist} - ${title}`);
+              if (typeof window.playFixed === "function") {
+                await window.playFixed({ track_id: trackId, name: `${artist} - ${title}` });
+                return;
+              }
+              await playHistoryTrack(trackId, `${artist} - ${title}`);
+              return;
+            }
+
+            toast(`⚡ Запуск: ${artist} - ${title}...`);
             const res = await fetch(`${API_BASE}/api/v1/catalog/play`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ artist, title, album, duration_sec, id })
+              body: JSON.stringify({ artist, title, album, duration_sec, id, track_id: trackId || undefined })
             });
             const data = await res.json();
             if (data.success && data.track_id) {
-              playHistoryTrack(data.track_id, `${artist} - ${title}`);
+              if (typeof window.playFixed === "function") {
+                await window.playFixed({ track_id: data.track_id, name: `${artist} - ${title}` });
+              } else {
+                await playHistoryTrack(data.track_id, `${artist} - ${title}`);
+              }
             } else {
               toast("Ошибка запуска: " + (data.error || "не удалось запустить"));
             }

@@ -20,6 +20,7 @@ export const config = {
   dynamicDir: path.resolve(PROJECT_ROOT, "dynamic"),
   favoritesDir: path.resolve(PROJECT_ROOT, "data", "music", "favorites"),
   dbPath: path.resolve(PROJECT_ROOT, "data", "db", "musik.db"),
+  cookiesPath: Deno.env.get("COOKIES_PATH") || path.resolve(PROJECT_ROOT, "cookies.txt"),
   
   // Tooling (cross-platform with local bin and system fallbacks)
   ytdlpPath: Deno.env.get("YTDLP_PATH") || (Deno.build.os === "windows" ? path.resolve(PROJECT_ROOT, "bin", "yt-dlp.exe") : "yt-dlp"),

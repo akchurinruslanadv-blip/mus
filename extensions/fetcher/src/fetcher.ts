@@ -3,6 +3,7 @@ import * as path from "@std/path";
 import { config } from "./config.ts";
 import { getDb, upsertTrack, isTrackPinned, markTrackUnavailable } from "./db.ts";
 import { compute512DEmbedding } from "./embedder_client.ts";
+import { ensureCookies } from "./cookie_manager.ts";
 import { FetchOptions, FetchResult } from "./types.ts";
 
 export async function fetchAudioStream(
@@ -91,6 +92,7 @@ export async function fetchAudioStream(
   let lastError = "";
 
   for (const strat of strategies) {
+    const cookiesFile = ensureCookies();
     const outputTemplate = path.join(targetDir, "%(id)s.%(ext)s");
     const args = [
       "--no-playlist",
@@ -100,10 +102,15 @@ export async function fetchAudioStream(
       "--encoding", "utf-8",
       "--no-warnings",
       "--match-filter", `duration <= ${config.maxTrackDurationSec} & duration >= ${config.minTrackDurationSec}`,
+    ];
+    if (cookiesFile) {
+      args.push("--cookies", cookiesFile);
+    }
+    args.push(
       strat.query,
       "-o", outputTemplate,
       "--print", "after_move:%(filepath)s|||%(duration)s|||%(filesize,filesize_approx)s|||%(id)s|||%(title)s|||%(uploader)s"
-    ];
+    );
 
     try {
       const cmd = new Deno.Command(config.ytdlpPath, {
@@ -332,14 +339,17 @@ export async function searchOnlineTracks(
     PYTHONUTF8: "1"
   };
 
+  const cookiesFile = ensureCookies();
   const args = [
     "--no-playlist",
     "--socket-timeout", "10",
     "--encoding", "utf-8",
     "--no-warnings",
-    `ytsearch${limit}:${query} audio`,
-    "--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s"
   ];
+  if (cookiesFile) {
+    args.push("--cookies", cookiesFile);
+  }
+  args.push(`ytsearch${limit}:${query} audio`, "--print", "%(id)s|||%(title)s|||%(uploader)s|||%(duration)s");
 
   try {
     const cmd = new Deno.Command(config.ytdlpPath, { args, env, stdout: "piped", stderr: "piped" });
