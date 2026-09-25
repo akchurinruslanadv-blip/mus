@@ -12,7 +12,7 @@ export class RadioPoolManager {
   private isManaging = false;
   private isBusy = false;
   private checkIntervalId?: ReturnType<typeof setInterval>;
-  private readonly targetPoolSize = 2;
+  private readonly targetPoolSize = 4;
   private isProcessing = false;
   private activeTask: {
     trackId?: number;
@@ -29,13 +29,13 @@ export class RadioPoolManager {
   public start(): void {
     if (this.isManaging) return;
     this.isManaging = true;
-    console.log("[radio-pool] Started Active 512D Pre-Indexing Pool Manager.");
-    // Periodic check every 30s to keep warm candidates in pool without wasting CPU
+    console.log("[radio-pool] Started Active 512D Pre-Indexing Pool Manager (Tournament Pool Size: 4).");
+    // Periodic check every 15s to keep warm candidates in pool without wasting CPU
     this.checkIntervalId = setInterval(() => {
       this.maintainPool().catch(err => {
         console.error("[radio-pool] Error maintaining pool:", err);
       });
-    }, 30000);
+    }, 15000);
     // Initial run
     this.maintainPool().catch(() => {});
   }
@@ -95,15 +95,20 @@ export class RadioPoolManager {
         await this.replenishPool(session, biases);
       }
 
-      // Process next unindexed candidate in pool (one at a time)
-      const unready = this.pool.find(c => !c.isReady);
-      if (unready) {
+      // Process unindexed candidates in pool sequentially while track plays
+      while (this.isManaging) {
+        const unready = this.pool.find(c => !c.isReady);
+        if (!unready) break;
+
         this.isProcessing = true;
         try {
           await this.indexCandidate(unready);
         } finally {
           this.isProcessing = false;
         }
+
+        // Brief 400ms pause to yield event loop and avoid CPU saturation
+        await new Promise(r => setTimeout(r, 400));
       }
     } finally {
       this.isBusy = false;
