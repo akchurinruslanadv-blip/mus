@@ -87,7 +87,7 @@ export async function handleQueueChange(): Promise<void> {
           else {
             const extRow = db.prepare(`
               SELECT ytdl_id FROM external_catalog 
-              WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+              WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE
                 AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
               LIMIT 1
             `).get(item.artist, item.title) as { ytdl_id?: string } | undefined;

@@ -64,8 +64,45 @@ console.log(`=======================================================`);
 // Session recent tracks tracking to avoid repetitive recommendations
 const sessionRecentMap = new Map<string, number[]>();
 
+// Fast retrieval of an authentic track whose audio is guaranteed to be on disk
+function getHotStartingTrack(db = getDb()): { id: number; artist: string; title: string; album: string; path: string; duration: number } | null {
+  // 1. Try to pick from on-disk favorites first (familiar taste)
+  const favCandidates = db.prepare(`
+    SELECT t.id, t.artist, t.title, t.album, t.path, t.duration
+    FROM favorites f
+    JOIN tracks t ON f.track_id = t.id
+    WHERE t.is_active = 1 AND t.path IS NOT NULL
+    ORDER BY RANDOM()
+    LIMIT 30
+  `).all() as any[];
+
+  for (const c of favCandidates) {
+    try {
+      if (c.path && Deno.statSync(c.path).isFile) return c;
+    } catch {}
+  }
+
+  // 2. Fallback: Any active track with existing audio file on disk
+  const anyCandidates = db.prepare(`
+    SELECT t.id, t.artist, t.title, t.album, t.path, t.duration
+    FROM tracks t
+    WHERE t.is_active = 1 AND t.path IS NOT NULL
+    ORDER BY RANDOM()
+    LIMIT 50
+  `).all() as any[];
+
+  for (const c of anyCandidates) {
+    try {
+      if (c.path && Deno.statSync(c.path).isFile) return c;
+    } catch {}
+  }
+
+  return null;
+}
+
 // Builder for dynamic balanced queue honoring user's discoveryRatio and 12D mood biases
 function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecentIds: number[] = [], sessionId = "default"): any[] {
+  const tQueueStart = performance.now();
   const db = getDb();
   const settings = getRadioSettings(sessionId, db);
   const ratio = settings.discoveryRatio;
@@ -233,6 +270,9 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
       }
     }
   }
+
+  const tQueueTotal = performance.now() - tQueueStart;
+  console.log(`[timing] Balanced radio queue generated in ${tQueueTotal.toFixed(1)}ms (${queue.length} tracks, ratio: ${ratio})`);
 
   return queue;
 }
@@ -938,6 +978,7 @@ Deno.serve({ port: config.port }, async (req: Request) => {
     // 0. Intercept /api/stream/:id for On-Demand Audio Resolution & Range Support
     const streamMatch = url.pathname.match(/^\/api\/stream\/(\d+)$/);
     if (streamMatch && (req.method === "GET" || req.method === "HEAD")) {
+      const tStreamStart = performance.now();
       const trackId = parseInt(streamMatch[1], 10);
       const db = getDb();
       const track = db.prepare(`SELECT id, path, title, artist, ytdl_id FROM tracks WHERE id = ?`).get(trackId) as { id: number; path: string; title: string; artist: string; ytdl_id?: string } | undefined;
@@ -945,7 +986,14 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       if (track) {
         let fileExists = track.path ? await Deno.stat(track.path).then(s => s.isFile).catch(() => false) : false;
 
-        // 1. Determine preferred YouTube ID
+        // 1. FAST PATH: If audio file exists on disk, serve immediately in 1-2ms!
+        if (fileExists) {
+          const tServe = performance.now() - tStreamStart;
+          console.log(`[timing] Stream Track ${trackId} served directly from disk in ${tServe.toFixed(1)}ms (cache HIT, 0ms wait)`);
+          return await serveDirectAudioFile(track.path, req);
+        }
+
+        // 2. Determine preferred YouTube ID
         let preferredYtdlId = track.ytdl_id;
         if (!preferredYtdlId && track.path) {
           const match = track.path.match(/\[([a-zA-Z0-9_-]{11})\]/);
@@ -954,84 +1002,70 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         if (!preferredYtdlId) {
           const extRow = db.prepare(`
             SELECT ytdl_id FROM external_catalog 
-            WHERE LOWER(TRIM(artist)) = LOWER(TRIM(?)) AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+            WHERE artist = ? COLLATE NOCASE AND title = ? COLLATE NOCASE
               AND ytdl_id IS NOT NULL AND length(ytdl_id) >= 11
             LIMIT 1
           `).get(track.artist, track.title) as { ytdl_id?: string } | undefined;
           if (extRow?.ytdl_id) preferredYtdlId = extRow.ytdl_id;
         }
 
-        // 2. Check if file exists under its YouTube ID filename in dynamic/
-        if (!fileExists && preferredYtdlId) {
+        // 3. Check if file exists under its YouTube ID filename in dynamic/
+        if (preferredYtdlId) {
           const altPath = path.join(config.dynamicDir, `${preferredYtdlId}.webm`);
           if (await Deno.stat(altPath).then(s => s.isFile).catch(() => false)) {
             track.path = altPath;
-            fileExists = true;
             try {
               const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(altPath, trackId);
               if (!conflict) {
                 db.prepare(`UPDATE tracks SET path = ?, ytdl_id = ?, is_active = 1 WHERE id = ?`).run(altPath, preferredYtdlId, trackId);
               }
             } catch {}
+            const tServe = performance.now() - tStreamStart;
+            console.log(`[timing] Stream Track ${trackId} served from dynamic cache in ${tServe.toFixed(1)}ms (0ms wait)`);
+            return await serveDirectAudioFile(altPath, req);
           }
         }
 
-        // 3. If audio file is missing on disk, resolve it on-demand with preferredYtdlId
-        if (!fileExists) {
-          console.log(`[stream-proxy] Audio missing on disk for Track ${trackId} ("${track.artist} - ${track.title}"). On-demand resolving (ytdl: ${preferredYtdlId || "searching"})...`);
-          const query = `${track.artist} - ${track.title}`.trim();
-          const fetchRes = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
-          if (fetchRes.success && fetchRes.filePath) {
-            track.path = fetchRes.filePath;
-            fileExists = true;
-            try {
-              const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(fetchRes.filePath, trackId) as { id: number } | undefined;
-              if (conflict) {
-                db.prepare(`UPDATE tracks SET file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
-                  fetchRes.sizeBytes || 0,
-                  fetchRes.ytdlId || preferredYtdlId || null,
-                  new Date().toISOString(),
-                  trackId
-                );
-              } else {
-                db.prepare(`UPDATE tracks SET path = ?, file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
-                  fetchRes.filePath,
-                  fetchRes.sizeBytes || 0,
-                  fetchRes.ytdlId || preferredYtdlId || null,
-                  new Date().toISOString(),
-                  trackId
-                );
-              }
-            } catch (err) {
-              console.warn(`[stream-proxy] Error updating tracks table for ${trackId}:`, err);
-            }
-            try {
-              await fetch(`${config.playerUrl}/api/reload`, { method: "POST" });
-            } catch {}
-          }
-        }
-
-        // If file exists, try proxying to Go core first
-        if (fileExists) {
+        // 4. On-demand resolving (Cold search / download)
+        console.log(`[stream-proxy] Audio missing on disk for Track ${trackId} ("${track.artist} - ${track.title}"). On-demand resolving (ytdl: ${preferredYtdlId || "searching"})...`);
+        const query = `${track.artist} - ${track.title}`.trim();
+        const fetchRes = await fetchAudioStream(query, { mode: "cache", preferredYtdlId });
+        if (fetchRes.success && fetchRes.filePath) {
+          track.path = fetchRes.filePath;
           try {
-            const upstreamRes = await fetch(new Request(upstreamUrl.toString(), {
-              method: req.method,
-              headers: forwardHeaders
-            }));
-
-            if (upstreamRes.ok || upstreamRes.status === 206) {
-              return upstreamRes;
+            const conflict = db.prepare(`SELECT id FROM tracks WHERE path = ? AND id != ?`).get(fetchRes.filePath, trackId) as { id: number } | undefined;
+            if (conflict) {
+              db.prepare(`UPDATE tracks SET file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
+                fetchRes.sizeBytes || 0,
+                fetchRes.ytdlId || preferredYtdlId || null,
+                new Date().toISOString(),
+                trackId
+              );
+            } else {
+              db.prepare(`UPDATE tracks SET path = ?, file_size = ?, ytdl_id = COALESCE(?, ytdl_id), is_active = 1, updated_at = ? WHERE id = ?`).run(
+                fetchRes.filePath,
+                fetchRes.sizeBytes || 0,
+                fetchRes.ytdlId || preferredYtdlId || null,
+                new Date().toISOString(),
+                trackId
+              );
             }
+          } catch (err) {
+            console.warn(`[stream-proxy] Error updating tracks table for ${trackId}:`, err);
+          }
+          try {
+            await fetch(`${config.playerUrl}/api/reload`, { method: "POST" });
           } catch {}
-
-          // Fallback: Direct audio stream with Range / 206 support
-          return await serveDirectAudioFile(track.path, req);
+          const tServe = performance.now() - tStreamStart;
+          console.log(`[timing] Stream Track ${trackId} resolved and served in ${tServe.toFixed(1)}ms`);
+          return await serveDirectAudioFile(fetchRes.filePath, req);
         }
       }
     }
 
     // A. Intercept /api/radio/start
     if (url.pathname === "/api/radio/start" && req.method === "POST") {
+      const tRadioStart = performance.now();
       const upstreamRes = await fetch(upstreamUrl.toString(), {
         method: "POST",
         headers: forwardHeaders,
@@ -1043,6 +1077,43 @@ Deno.serve({ port: config.port }, async (req: Request) => {
       try { data = JSON.parse(rawText); } catch {}
 
       if (upstreamRes.ok && data) {
+        const db = getDb();
+        let curTrack = data.current;
+        let fileOnDisk = false;
+        if (curTrack?.path) {
+          try { fileOnDisk = Deno.statSync(curTrack.path).isFile; } catch {}
+        }
+        if (!fileOnDisk && curTrack?.id) {
+          const tRow = db.prepare(`SELECT path, ytdl_id FROM tracks WHERE id = ?`).get(curTrack.id) as any;
+          if (tRow?.path) {
+            try { fileOnDisk = Deno.statSync(tRow.path).isFile; } catch {}
+          }
+          if (!fileOnDisk && tRow?.ytdl_id) {
+            const altPath = path.join(config.dynamicDir, `${tRow.ytdl_id}.webm`);
+            try { fileOnDisk = Deno.statSync(altPath).isFile; } catch {}
+          }
+        }
+
+        // Zero-Latency Radio Start: If Go core picked a track whose audio is missing,
+        // switch immediately to an authentic on-disk track (e.g. from favorites) so the user
+        // hears music instantly in 0ms instead of waiting 25s for YouTube cold download!
+        if (!fileOnDisk) {
+          const hotTrack = getHotStartingTrack(db);
+          if (hotTrack) {
+            console.log(`[radio-start] Track ${curTrack?.id} ("${curTrack?.artist} - ${curTrack?.title}") missing on disk. Switched to hot track ${hotTrack.id} ("${hotTrack.artist} - ${hotTrack.title}") for instant 0ms start!`);
+            data.current = {
+              id: hotTrack.id,
+              artist: hotTrack.artist,
+              title: hotTrack.title,
+              album: hotTrack.album || "Instant Radio",
+              duration: Math.round(hotTrack.duration || 180),
+              path: hotTrack.path,
+              ready: true,
+              stream: `/api/stream/${hotTrack.id}`
+            };
+          }
+        }
+
         const curId = data.current?.id || 0;
         if (data.session_id && curId) {
           sessionRecentMap.set(data.session_id, [curId]);
@@ -1050,11 +1121,15 @@ Deno.serve({ port: config.port }, async (req: Request) => {
         
         // Build balanced queue according to slider
         data.queue = buildBalancedRadioQueue(curId, 6);
+        delete data.tracks; // Prevent app.js from hiding queue panel
 
         if (data.session_id) {
           updateSessionQueue(data.session_id, curId, data.queue);
         }
         radioPoolManager.maintainPool().catch(() => {});
+
+        const tRadioTotal = performance.now() - tRadioStart;
+        console.log(`[timing] /api/radio/start completed in ${tRadioTotal.toFixed(1)}ms. Playing Track ${data.current?.id} ("${data.current?.artist} - ${data.current?.title}")`);
 
         return new Response(JSON.stringify(data), {
           status: 200,
