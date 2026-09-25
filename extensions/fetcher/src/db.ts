@@ -10,6 +10,8 @@ export function getDb(): Database {
     _db = new Database(config.dbPath);
     try {
       _db.exec("PRAGMA journal_mode = WAL;");
+      _db.exec("PRAGMA synchronous = NORMAL;");
+      _db.exec("PRAGMA cache_size = -64000;");
       _db.exec("PRAGMA busy_timeout = 5000;");
     } catch {}
     initSchema(_db);
@@ -131,6 +133,11 @@ export function initSchema(db: Database): void {
       db.prepare(`
         CREATE INDEX IF NOT EXISTS idx_listening_history_track 
         ON listening_history(track_id, ts DESC)
+      `).run();
+
+      db.prepare(`
+        CREATE INDEX IF NOT EXISTS idx_listening_history_action_ts 
+        ON listening_history(action, ts DESC)
       `).run();
     }
   } catch {}

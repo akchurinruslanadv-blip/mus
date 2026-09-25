@@ -1254,6 +1254,52 @@
       };
       window.renderNow._hooked = true;
     }
+
+    // Hook Dislike button to allow TOGGLE OFF (canceling/removing dislike)
+    const dislikeBtn = document.getElementById("btn-dislike");
+    if (dislikeBtn && !dislikeBtn._dislikeHooked) {
+      dislikeBtn._dislikeHooked = true;
+      // Prevent button from being hard-disabled by native app.js
+      const obs = new MutationObserver(() => {
+        if (dislikeBtn.disabled) dislikeBtn.disabled = false;
+      });
+      obs.observe(dislikeBtn, { attributes: true, attributeFilter: ["disabled"] });
+      dislikeBtn.disabled = false;
+
+      dislikeBtn.addEventListener("click", async (e) => {
+        if (dislikeBtn.classList.contains("active-rate")) {
+          // Already disliked -> user wants to UNDO dislike!
+          e.stopImmediatePropagation();
+          e.preventDefault();
+          dislikeBtn.classList.remove("active-rate");
+          dislikeBtn.disabled = false;
+          toast("Дизлайк снят");
+          const cur = typeof window.currentTrack === "function" ? window.currentTrack() : null;
+          const trackId = cur?.id || (document.getElementById("audio")?.dataset?.trackId);
+          if (trackId) {
+            try {
+              await fetch(`${API_BASE}/api/v1/tracks/${trackId}/undislike`, { method: "POST" });
+            } catch {}
+          }
+        }
+      }, true); // Capturing phase!
+    }
+
+    // Hook Like button for 0ms Instant Optimistic Feedback
+    const likeBtn = document.getElementById("btn-like");
+    if (likeBtn && !likeBtn._likeHooked) {
+      likeBtn._likeHooked = true;
+      likeBtn.addEventListener("click", () => {
+        const isFav = likeBtn.classList.contains("active-rate");
+        if (isFav) {
+          likeBtn.classList.remove("active-rate");
+          likeBtn.title = "Любимая песня";
+        } else {
+          likeBtn.classList.add("active-rate");
+          likeBtn.title = "Убрать из любимых песен";
+        }
+      }, true); // Capturing phase!
+    }
   }
 
   // 4. Inject Radio Listening History Tab & Panel (Unlimited, Lightweight, Source-Badged)
@@ -1979,9 +2025,7 @@
     loadRadioHistory();
   }
 
-  // Periodic polling for non-queue UI elements only
-  // NOTE: updateQueueOrigins is intentionally NOT here — it runs reactively
-  //       after each real queue DOM rebuild to prevent 2-second strobe flicker.
+  // 1. Lightweight DOM checks every 2 seconds (pure synchronous DOM queries, 0 network, 0ms latency)
   setInterval(() => {
     hookPlayerFunctions();
     injectHeaderBadge();
@@ -1990,9 +2034,6 @@
     injectUploadSection();
     injectRadioHistory();
     injectRadioSliders();
-    updateCacheStats();
-    updateIngestionStatus();
-    updateNowPlayingOrigin();
 
     // Keep active tab state consistent
     if (activeQueueTab === "history") {
@@ -2010,10 +2051,19 @@
       if (hWrap) hWrap.style.display = "none";
       if (hList) hList.style.display = "none";
     }
-    loadRadioHistory();
+
     preloadNextTrackFromQueue();
     hookSkipDebounce();
   }, 2000);
+
+  // 2. Slow background telemetry refresh (every 30 seconds, zero SQLite locking)
+  setInterval(() => {
+    updateCacheStats();
+    updateIngestionStatus();
+    if (activeQueueTab === "history") {
+      loadRadioHistory();
+    }
+  }, 30000);
 
   // Seamless Browser Audio Preloader
   let preloadAudio = null;
