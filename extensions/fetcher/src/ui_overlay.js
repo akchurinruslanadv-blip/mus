@@ -2011,7 +2011,63 @@
       if (hList) hList.style.display = "none";
     }
     loadRadioHistory();
+    preloadNextTrackFromQueue();
+    hookSkipDebounce();
   }, 2000);
+
+  // Seamless Browser Audio Preloader
+  let preloadAudio = null;
+  function getPreloadAudio() {
+    if (!preloadAudio) {
+      preloadAudio = document.getElementById("addon-preload-audio");
+      if (!preloadAudio) {
+        preloadAudio = document.createElement("audio");
+        preloadAudio.id = "addon-preload-audio";
+        preloadAudio.preload = "auto";
+        preloadAudio.muted = true;
+        preloadAudio.style.display = "none";
+        document.body.appendChild(preloadAudio);
+      }
+    }
+    return preloadAudio;
+  }
+
+  function preloadNextTrackFromQueue() {
+    try {
+      fetch(`${API_BASE}/api/now`).then(r => r.json()).then(now => {
+        if (now && now.queue && now.queue.length > 0) {
+          const firstQ = now.queue[0];
+          const tid = firstQ.track_id || firstQ.id;
+          if (tid) {
+            const pa = getPreloadAudio();
+            if (pa.dataset.preloadedId !== String(tid)) {
+              pa.dataset.preloadedId = String(tid);
+              pa.src = `/api/stream/${tid}`;
+              console.log(`[ui-preload] Seamlessly buffered next track #${tid} into browser RAM`);
+            }
+          }
+        }
+      }).catch(() => {});
+    } catch {}
+  }
+
+  // Prevent double-click race conditions on skip buttons
+  function hookSkipDebounce() {
+    ["btn-skip", "mini-skip"].forEach(id => {
+      const btn = document.getElementById(id);
+      if (btn && !btn.dataset.debounced) {
+        btn.dataset.debounced = "1";
+        btn.addEventListener("click", () => {
+          btn.style.pointerEvents = "none";
+          btn.style.opacity = "0.5";
+          setTimeout(() => {
+            btn.style.pointerEvents = "auto";
+            btn.style.opacity = "1";
+          }, 800);
+        }, true);
+      }
+    });
+  }
 
   // Initial attempt
   setTimeout(() => {

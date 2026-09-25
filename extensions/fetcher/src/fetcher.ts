@@ -98,6 +98,7 @@ export async function fetchAudioStream(
       "--no-playlist",
       "--socket-timeout", "10",
       "--retries", "2",
+      "--concurrent-fragments", "2",
       "-f", config.audioFormat,
       "--encoding", "utf-8",
       "--no-warnings",

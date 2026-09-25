@@ -267,6 +267,40 @@ function buildBalancedRadioQueue(currentTrackId: number, count = 6, excludeRecen
       if (readyIdx > 0) {
         const [readyTrack] = queue.splice(readyIdx, 1);
         queue.unshift(readyTrack);
+      } else {
+        const readyPoolCand = radioPoolManager.getReadyPool().find(c => c.trackId && !selectedIds.has(c.trackId));
+        if (readyPoolCand && readyPoolCand.trackId) {
+          queue.unshift({
+            track_id: readyPoolCand.trackId,
+            artist: readyPoolCand.artist,
+            title: readyPoolCand.title,
+            album: "Radio Discovery",
+            path: readyPoolCand.filePath || "",
+            duration: 180,
+            score: readyPoolCand.score || 0.85,
+            explanation: readyPoolCand.explanation || "🧠 Горячий трек из пула",
+            explore: true,
+            new_boost: true,
+            cluster_id: -1
+          });
+        } else {
+          const hot = getHotStartingTrack(db);
+          if (hot && !selectedIds.has(hot.id)) {
+            queue.unshift({
+              track_id: hot.id,
+              artist: hot.artist,
+              title: hot.title,
+              album: hot.album,
+              path: hot.path,
+              duration: hot.duration,
+              score: 0.9,
+              explanation: "Готовый трек (Zero-Stall)",
+              explore: false,
+              new_boost: false,
+              cluster_id: -1
+            });
+          }
+        }
       }
     }
   }
